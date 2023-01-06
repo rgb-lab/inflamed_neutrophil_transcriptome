@@ -1,0 +1,42 @@
+---
+title: "Inflammatory Subsets"
+author: "Felix Radtke"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r, message=FALSE}
+source("scripts/utils/utils.R")
+source("scripts/utils/figure_builder.R")
+```
+
+Retrieve DESeq2 and Fisher Combined results.
+```{r}
+res_list <- readRDS("data/processed/de_seq_res_list.rds")
+up_genes <- readRDS("data/processed/fisher_up_genes.rds")
+dn_genes <- readRDS("data/processed/fisher_dn_genes.rds")
+```
+
+Evaluate DE genes per comparison, arrange the DF.
+```{r}
+df <- setNames(data.frame(matrix(ncol = 3, nrow = 0)), c("n", "n_de", "n_fisher"))
+for(i in 1:length(res_list)){
+  current_comparison <- names(res_list)[i]
+  current_n <- nrow(res_list[[i]])
+  current_n_de <- nrow(subset(res_list[[i]], padj < 0.05 & abs(log2FoldChange) >= 0.5))
+  current_n_up <- nrow(subset(res_list[[i]], padj < 0.05 & log2FoldChange >= 0.5))
+  current_n_dn <- nrow(subset(res_list[[i]], padj < 0.05 & log2FoldChange <= -0.5))
+  current_n_de_fisher <- nrow(subset(res_list[[i]], padj < 0.05 & abs(log2FoldChange) >= 0.5 & rownames(res_list[[i]]) %in% c(up_genes, dn_genes)))
+    df <- rbind(df, c(current_comparison, current_n, current_n_de, current_n_up, current_n_dn, current_n_de_fisher))
+}
+colnames(df) <- c("comparison", "n", "n_de", "n_up", "n_dn", "n_fisher")
+df[,c("n", "n_de", "n_up", "n_dn", "n_fisher")] <- lapply(df[,c("n", "n_de", "n_up", "n_dn", "n_fisher")], as.numeric)
+df$n_minus_de <- df$n - df$n_de
+df$n
+# df$frac_de <- df$n_de / df$n
+# df$frac_fisher <- df$n_fisher / df$n
+saveRDS(df, "data/processed/data_fig_s2.rds")
+```

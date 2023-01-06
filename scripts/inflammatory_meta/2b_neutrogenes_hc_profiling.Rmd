@@ -1,0 +1,553 @@
+---
+title: "Healthy control neutrophil lineage gene profiling"
+author: "NSH"
+output: html_notebook
+---
+
+```{r setup}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r, message=FALSE}
+if (!require (tidyverse)) install.packages("tidyverse")
+if (!require (zeallot)) install.packages("zeallot")
+if (!require (ComplexHeatmap)) install.packages("ComplexHeatmap")
+if (!require (ggpubr)) install.packages("ggpubr")
+if (!require (gridExtra)) install.packages("gridExtra")
+if (!require (RColorBrewer)) install.packages("RColorBrewer")
+if (!require (reshape2)) install.packages("reshape2")
+if (!require (DESeq2)) install.packages("DESeq2")
+if (!require (edgeR)) install.packages("edgeR")
+if (!require (limma)) install.packages("limma")
+if (!require (circlize)) install.packages("circlize")
+if (!require (magick)) install.packages("magick")
+if (!require (lme4)) install.packages("lme4")
+
+if (!require (BiocManager)) install.packages("BiocManager")
+if (!require(biomaRt)) BiocManager::install("biomaRt")
+
+source("scripts/utils/figure_builder.R")
+source("scripts/utils/utils.R")
+```
+
+
+Load the data for downstream analysis
+```{r}
+salmon_se_hs_symbol <- readRDS("data/processed/haemopedia_salmon_se_hs.rds")
+salmon_se_mm_symbol <- readRDS("data/processed/haemopedia_salmon_se_mm.rds")
+
+salmon_inflamm_hs_symbol <- readRDS("data/processed/arch_hs_se.rds")
+salmon_inflamm_mm_symbol <- readRDS("data/processed/arch_mm_se.rds")
+
+ensembl_human <- useEnsembl(biomart="ensembl", dataset="hsapiens_gene_ensembl", version = 107)
+ensembl_mouse <- useEnsembl(biomart="ensembl", dataset="mmusculus_gene_ensembl", version = 107)
+```
+
+# Define lineage genes
+
+```{r}
+## PREPROCESS THE DATA ##
+colData(salmon_se_hs_symbol)[["lineage_clean"]] <-
+  as.factor(str_replace_all(colData(salmon_se_hs_symbol)[["lineage_clean"]], " ", "_"))
+colData(salmon_se_hs_symbol)[["lineage_clean"]] <-
+  relevel(colData(salmon_se_hs_symbol)[["lineage_clean"]], ref = "Neutrophils")
+
+
+dge_human <- SE2DGEList(salmon_se_hs_symbol)
+
+# lcpm_human <- edgeR::cpm(dge_human,
+#                          normalized.lib.sizes = TRUE,
+#                          log = TRUE)
+
+design_human <- ~ 0 + lineage_clean
+design_matrix_human <- model.matrix(design_human, data = dge_human[["samples"]])
+  
+contrasts_human <- expand.grid("Neutrophils",
+                         setdiff(dge_human[["samples"]]$lineage_clean, "Neutrophils")) %>%
+  mutate (contr = paste(paste0("lineage_clean", Var1), paste0("lineage_clean", Var2), sep = "-")) %>%
+  pull (contr)
+contrast_matrix_human <- makeContrasts(contrasts = contrasts_human,
+                                 levels = paste0("lineage_clean",
+                                                 levels(dge_human[["samples"]]$lineage_clean)))
+
+keep_human <- filterByExpr(dge_human, design_matrix_human)
+dge_human <- dge_human[keep_human,,keep.lib.sizes=FALSE]
+dge_human <- calcNormFactors(dge_human, method = "TMM")
+voom_human <- voom (dge_human,
+              design = design_matrix_human,
+              plot = TRUE)
+  
+fit_human <- lmFit(voom_human, design = design_matrix_human)
+fit2_human <- contrasts.fit(fit_human, contrast_matrix_human)
+efit_human <- eBayes(fit2_human)
+  
+ttable_human <- topTable(efit_human, number = Inf) %>%
+  as.data.frame()
+
+# no lfc here, instead treat with lfc
+dt_human <- decideTests(efit_human,
+                        lfc = 1
+                  #method = "global"
+                  )
+  #genes <- names(rowSums(dt)[rowSums(dt) == ncol(dt)])
+dt_arranged_human <- dt_human %>%
+  as.data.frame() %>%
+  rownames_to_column("symbol") %>%
+  rowwise() %>%
+  mutate(sum = sum(c_across(!all_of("symbol")))) %>%
+  filter(sum == 5) %>%
+  left_join(ttable_human %>%
+              rownames_to_column("symbol") %>%
+              dplyr::select(symbol, `F`)) %>%
+  arrange(desc(sum), desc(`F`)) %>%
+  ungroup() %>%
+  mutate(rank = 1:length(sum))
+
+
+
+
+colData(salmon_se_mm_symbol)[["lineage_clean"]] <-
+  as.factor(str_replace_all(colData(salmon_se_mm_symbol)[["lineage_clean"]], " ", "_"))
+colData(salmon_se_mm_symbol)[["lineage_clean"]] <-
+  relevel(colData(salmon_se_mm_symbol)[["lineage_clean"]], ref = "Neutrophils")
+
+dge_mouse <- SE2DGEList(salmon_se_mm_symbol)
+
+# lcpm_mouse <- edgeR::cpm(dge_mouse,
+#                          normalized.lib.sizes = TRUE,
+#                          log = TRUE)
+
+design_mouse <- ~ 0 + lineage_clean
+design_matrix_mouse <- model.matrix(design_mouse, data = dge_mouse[["samples"]])
+  
+contrasts_mouse <- expand.grid("Neutrophils",
+                         setdiff(dge_mouse[["samples"]]$lineage_clean, "Neutrophils")) %>%
+  mutate (contr = paste(paste0("lineage_clean", Var1), paste0("lineage_clean", Var2), sep = "-")) %>%
+  pull (contr)
+contrast_matrix_mouse <- makeContrasts(contrasts = contrasts_mouse,
+                                 levels = paste0("lineage_clean",
+                                                 levels(dge_mouse[["samples"]]$lineage_clean)))
+
+keep_mouse <- filterByExpr(dge_mouse, design_matrix_mouse)
+dge_mouse <- dge_mouse[keep_mouse,,keep.lib.sizes=FALSE]
+dge_mouse <- calcNormFactors(dge_mouse, method = "TMM")
+voom_mouse <- voom (dge_mouse,
+              design = design_matrix_mouse,
+              plot = TRUE)
+  
+fit_mouse <- lmFit(voom_mouse, design = design_matrix_mouse)
+fit2_mouse <- contrasts.fit(fit_mouse, contrast_matrix_mouse)
+efit_mouse <- eBayes(fit2_mouse)
+#efit <- treat(fit2, lfc = 1.5)
+  
+ttable_mouse <- topTable(efit_mouse, number = Inf) %>%
+  as.data.frame()
+# genes <- ttable %>%
+#   rownames_to_column("symbol") %>%
+#   dplyr::pull(symbol, F)
+  
+# no lfc here, instead treat with lfc
+dt_mouse <- decideTests(efit_mouse,
+                        lfc = 1
+                  #method = "global"
+                  )
+  #genes <- names(rowSums(dt)[rowSums(dt) == ncol(dt)])
+dt_arranged_mouse <- dt_mouse %>%
+  as.data.frame() %>%
+  rownames_to_column("symbol") %>%
+  rowwise() %>%
+  mutate(sum = sum(c_across(!all_of("symbol")))) %>%
+  filter(sum == 5) %>%
+  left_join(ttable_mouse %>%
+              rownames_to_column("symbol") %>%
+              dplyr::select(symbol, `F`)) %>%
+  arrange(desc(sum), desc(`F`)) %>%
+  ungroup() %>%
+  mutate(rank = 1:length(sum))
+```
+
+# Retrieve orthology mappings
+
+
+```{r}
+#########################
+# MAPPING USING ENSEMBL #
+#########################
+# ensembl dbs have been retrieved above
+
+attributes_human_query <- c(
+  "ensembl_gene_id",
+  "external_gene_name",
+  "mmusculus_homolog_ensembl_gene",
+  "mmusculus_homolog_associated_gene_name",
+  "mmusculus_homolog_orthology_type",
+  "mmusculus_homolog_subtype",
+  "mmusculus_homolog_perc_id",
+  "mmusculus_homolog_goc_score",
+  "mmusculus_homolog_wga_coverage",
+  "mmusculus_homolog_orthology_confidence"
+)
+attributes_mouse_query <- c(
+  "ensembl_gene_id",
+  "external_gene_name",
+  "hsapiens_homolog_ensembl_gene",
+  "hsapiens_homolog_associated_gene_name",
+  "hsapiens_homolog_orthology_type",
+  "hsapiens_homolog_subtype",
+  "hsapiens_homolog_perc_id",
+  "hsapiens_homolog_goc_score",
+  "hsapiens_homolog_wga_coverage",
+  "hsapiens_homolog_orthology_confidence"
+)
+
+ortho_human_to_mouse <- getBM(attributes = attributes_human_query,
+                              filters = c("with_mmusculus_homolog", "biotype"),
+                              values = list(TRUE, "protein_coding"),
+                              mart = ensembl_human) %>%
+  filter(#mmusculus_homolog_orthology_type == "ortholog_one2one",
+         mmusculus_homolog_orthology_confidence == 1#,
+         # external_gene_name != "",
+         # mmusculus_homolog_associated_gene_name != ""
+         )
+
+ortho_mouse_to_human <- getBM(attributes = attributes_mouse_query,
+                              filters = c("with_hsapiens_homolog", "biotype"),
+                              values = list(TRUE, "protein_coding"),
+                              mart = ensembl_mouse) %>%
+  filter(#hsapiens_homolog_orthology_type == "ortholog_one2one",
+         hsapiens_homolog_orthology_confidence == 1#,
+         # external_gene_name != "",
+         # hsapiens_homolog_associated_gene_name != ""
+         )
+
+# some info about retrieved genes
+
+if (any(duplicated(ortho_human_to_mouse$ensembl_gene_id)) |
+    any(duplicated(ortho_human_to_mouse$external_gene_name)) |
+    any(duplicated(ortho_human_to_mouse$mmusculus_homolog_ensembl_gene)) |
+    any(duplicated(ortho_human_to_mouse$mmusculus_homolog_associated_gene_name))) {
+  warning("Duplicate gene identifiers in human ensembl query result")
+}
+if (any(duplicated(ortho_mouse_to_human$ensembl_gene_id)) |
+    any(duplicated(ortho_mouse_to_human$external_gene_name)) |
+    any(duplicated(ortho_mouse_to_human$mmusculus_homolog_ensembl_gene)) |
+    any(duplicated(ortho_mouse_to_human$mmusculus_homolog_associated_gene_name))) {
+  warning("Duplicate gene identifiers in mouse ensembl query result")
+}
+
+message("Retrieved ",
+        length(ortho_human_to_mouse$external_gene_name),
+        " human gene symbols mapping one2one to orthologous ",
+        "mouse genes with high confidence.")
+message("Retrieved ",
+        length(ortho_mouse_to_human$external_gene_name),
+        " mouse gene symbols mapping one2one to orthologous ",
+        "human genes with high confidence.")
+
+message("Human symbols in human query not present in mouse query: ",
+        paste(ortho_human_to_mouse$external_gene_name[
+          !ortho_human_to_mouse$external_gene_name %in%
+            ortho_mouse_to_human$hsapiens_homolog_associated_gene_name], collapse = ", "))
+message("Mouse symbols in human query not present in mouse query: ",
+        paste(ortho_human_to_mouse$mmusculus_homolog_associated_gene_name[
+          !ortho_human_to_mouse$mmusculus_homolog_associated_gene_name %in%
+            ortho_mouse_to_human$external_gene_name], collapse = ", "))
+
+message("Mouse symbols in mouse query not present in human query: ",
+        paste(ortho_mouse_to_human$external_gene_name[
+          !ortho_mouse_to_human$external_gene_name %in%
+            ortho_human_to_mouse$mmusculus_homolog_associated_gene_name], collapse = ", "))
+message("Human symbols in mouse query not present in human query: ",
+        paste(ortho_mouse_to_human$hsapiens_homolog_associated_gene_name[
+          !ortho_mouse_to_human$hsapiens_homolog_associated_gene_name %in%
+            ortho_human_to_mouse$external_gene_name], collapse = ", "))
+```
+
+
+```{r}
+lin_spec_orthos_human <- dt_arranged_human %>%
+  transmute(symbol_human = symbol,
+            sum,
+            `F`,
+            rank) %>%
+  left_join(ortho_human_to_mouse %>%
+              transmute(symbol_human = external_gene_name,
+                        ortho_mouse = mmusculus_homolog_associated_gene_name,
+                        ortho_mouse_type = mmusculus_homolog_orthology_type),
+            by = "symbol_human") %>%
+  mutate(ortho_mouse_type = case_when(
+    is.na(ortho_mouse_type) ~ "ortholog_NA",
+    TRUE ~ ortho_mouse_type
+    )
+  )
+
+
+lin_spec_orthos_mouse <- dt_arranged_mouse %>%
+  transmute(symbol_mouse = symbol,
+            sum,
+            `F`,
+            rank) %>%
+  left_join(ortho_mouse_to_human %>%
+              transmute(symbol_mouse = external_gene_name,
+                        ortho_human = hsapiens_homolog_associated_gene_name,
+                        ortho_human_type = hsapiens_homolog_orthology_type),
+            by = "symbol_mouse") %>%
+  mutate(ortho_human_type = case_when(
+    is.na(ortho_human_type) ~ "ortholog_NA",
+    TRUE ~ ortho_human_type
+    )
+  )
+
+
+table(lin_spec_orthos_human$ortho_mouse_type)
+table(lin_spec_orthos_mouse$ortho_human_type)
+
+table(lin_spec_orthos_human$ortho_mouse %in% lin_spec_orthos_mouse$symbol_mouse)
+table(lin_spec_orthos_mouse$ortho_human %in% lin_spec_orthos_human$symbol_human)
+```
+
+## Get tpm for both species and log2 transform for plotting
+
+```{r}
+pb_hc_tpm_human <- assay(salmon_inflamm_hs_symbol, "abundance") %>%
+  as.data.frame() %>%
+  `+`(1) %>%
+  log2() %>%
+  dplyr::select(salmon_inflamm_hs_symbol %>%
+                  colData() %>%
+                  as.data.frame() %>%
+                  filter(condition == "HC",
+                         origin_tissue == "PB") %>%
+                  pull(SRX_accession)
+                  )
+
+pb_hc_tpm_mouse <- assay(salmon_inflamm_mm_symbol, "abundance") %>%
+  as.data.frame() %>%
+  `+`(1) %>%
+  log2() %>%
+  dplyr::select(salmon_inflamm_mm_symbol %>%
+                  colData() %>%
+                  as.data.frame() %>%
+                  filter(condition == "HC",
+                         origin_tissue %in% c("PB", "BM")) %>%
+                  pull(SRX_accession)
+                  )
+```
+
+
+# Join lineage specific genes and define expression groups
+
+```{r}
+jf_lin_spec_genes <- lin_spec_orthos_human %>%
+  transmute(
+    match_uniq_rn = paste(symbol_human, ortho_mouse, sep = "__"),
+    symbol_human,
+    ortho_mouse,
+    h2m_orthotype = ortho_mouse_type,
+    h2m_orig = T
+    ) %>%
+  full_join(
+    lin_spec_orthos_mouse %>%
+      transmute(
+        match_uniq_rn = paste(ortho_human, symbol_mouse, sep = "__"),
+        m2h_orthotype = ortho_human_type,
+        symbol_mouse,
+        ortho_human,
+        m2h_orig = T
+      ),
+    by = "match_uniq_rn"
+  ) %>%
+  rowwise() %>%
+  transmute(
+    match_uniq_rn,
+    # should be the same
+    symbol_human = paste(unique(na.omit(c(symbol_human, ortho_human))), collapse = "_ERR_"),
+    symbol_mouse = paste(unique(na.omit(c(symbol_mouse, ortho_mouse))), collapse = "_ERR_"),
+    orthotype = paste(unique(na.omit(c(h2m_orthotype, m2h_orthotype))), collapse = "_ERR_"),
+    orig_group = case_when(
+      h2m_orig && m2h_orig ~ "both",
+      h2m_orig && is.na(m2h_orig) ~ "human",
+      is.na(h2m_orig) && m2h_orig ~ "mouse",
+      TRUE ~ "ERR",
+    )
+  ) %>%
+  ungroup() %>%
+  # duplications probably from same symbol, different ENSEMBL ID genes
+  # TODO: follow up on this
+  distinct()
+
+stopifnot(!any(grepl("ERR", jf_lin_spec_genes)))
+
+
+# be sure to not produce garbage
+stopifnot(all(rownames(pb_hc_tpm_human) != ""))
+stopifnot(all(rownames(pb_hc_tpm_mouse) != ""))
+
+# filter to genes for which we have expression data
+table(jf_lin_spec_genes$symbol_human %in% rownames(pb_hc_tpm_human))
+table(jf_lin_spec_genes$symbol_mouse %in% rownames(pb_hc_tpm_mouse))
+
+# subset to genes expressed in the inflammatory dataset
+jf_lin_spec_genes %<>%
+  filter(
+    symbol_human %in% rownames(pb_hc_tpm_human) |
+      symbol_mouse %in% rownames(pb_hc_tpm_mouse)
+    )
+
+table(jf_lin_spec_genes$symbol_human %in% rownames(pb_hc_tpm_human))
+table(jf_lin_spec_genes$symbol_mouse %in% rownames(pb_hc_tpm_mouse))
+
+
+# model gene
+model_gene <- function (tpm, species, series) {
+  
+  # take care of non mappable genes
+  if (any(is.na(tpm))) return(list(beta = NA, P = NA))
+  
+  form1 <- as.formula("tpm ~ species + (1|series)")
+  lm1 <- lmer(form1, REML=FALSE)
+  
+  form0 <- as.formula("tpm ~ (1|series)")
+  lm0 <- lmer(form0, REML=FALSE)
+  
+  #perform likelihood ratio test using anova function
+  anv <- anova(lm0, lm1)
+  #output beta, other stats
+  gene_res <- c(summary(lm1)$coefficients[2,], anv$Chisq[2], anv$P[2])
+  # gene_res example:
+  
+  # summary(lm1)$coefficients[2,]        Chisq       P
+  
+  # Estimate  Std. Error     t value                         
+  # 26.29392640  6.72135490  3.91199792  6.16292182  0.01304555
+  
+  
+  return(list(beta = gene_res[1],
+              P = gene_res[5]))
+}
+
+
+jf_exp_meta_long <- jf_lin_spec_genes %>%
+  # join logtpm
+  left_join(pb_hc_tpm_human %>%
+              rownames_to_column("symbol_human")) %>%
+  left_join(pb_hc_tpm_mouse %>%
+              rownames_to_column("symbol_mouse")) %>%
+  pivot_longer(
+    cols = starts_with("SRX"),
+    names_to = "sample",
+    values_to = "log2tpm"
+  ) %>%
+  left_join(
+    rbind(
+      colData(salmon_inflamm_hs_symbol) %>%
+        as.data.frame() %>% 
+        dplyr::select(SRX_accession, species, series, condition),
+      colData(salmon_inflamm_mm_symbol) %>%
+        as.data.frame() %>% 
+        dplyr::select(SRX_accession, species, series, condition)
+    ) %>%
+      dplyr::rename(sample = SRX_accession)
+  ) %>%
+  group_by(match_uniq_rn) %>%
+  mutate(
+    avg_exp = mean(log2tpm, na.rm = T),
+    avg_exp_hs = mean(log2tpm[species == "Hs"]),
+    avg_exp_mm = mean(log2tpm[species == "Mm"]),
+    model_beta = model_gene(log2tpm, species, series)[["beta"]],
+         model_p = model_gene(log2tpm, species, series)[["P"]])
+
+jf_exp_meta <- jf_exp_meta_long %>%
+  pivot_wider(
+    id_cols = c(match_uniq_rn,
+                symbol_human,
+                symbol_mouse,
+                avg_exp,
+                avg_exp_hs,
+                avg_exp_mm,
+                model_p,
+                model_beta,
+                orthotype,
+                orig_group),
+    names_from = c(species, sample),
+    values_from = log2tpm
+  )
+
+
+exp_thr <- quantile(jf_exp_meta$avg_exp, 0.95, na.rm = T)
+
+jf_exp_stats <- jf_exp_meta %>%
+  mutate(model_padj = p.adjust(model_p,
+                               n = sum(!is.na(model_p)),
+                               method = "BH"),
+         padj_n = sum(!is.na(model_p)),
+         .after = model_p) %>%
+  # define groups
+  mutate(
+    exp_group = case_when(
+      avg_exp_hs > exp_thr & avg_exp_mm > exp_thr & orthotype != "ortholog_NA" & model_padj > 0.05 & abs(model_beta) < 1 ~ "a_hi_both",
+      avg_exp_hs > exp_thr & avg_exp_mm < exp_thr & orthotype != "ortholog_NA" & model_padj < 0.05 & model_beta <= -1 ~ "b_hi_hs",
+      avg_exp_hs < exp_thr & avg_exp_mm > exp_thr & orthotype != "ortholog_NA" & model_padj < 0.05 & model_beta >= 1~ "c_hi_mm",
+      (avg_exp_mm > exp_thr | avg_exp_hs > exp_thr) & orthotype == "ortholog_NA" ~ "d_not_mappable",
+      TRUE ~ "none"
+      ),
+    .after = orig_group
+  )
+
+jf_plt_all <- jf_exp_stats %>%
+  filter(exp_group != "none") %>%
+  mutate(group_split = case_when(
+    exp_group == "d_not_mappable" ~ paste(exp_group, orig_group, sep = "_"),
+    TRUE ~ exp_group
+  ),
+  .after = exp_group) %>%
+  arrange(group_split, desc(avg_exp))
+
+saveRDS(jf_plt_all, "data/processed/data_fig_2c_updated.rds")
+write_tsv(jf_plt_all, "data/processed/data_fig_2c_updated.tsv")
+```
+
+
+# fGSEA for different expression groups
+
+```{r}
+set_list <- list(
+  `High in both` = jf_plt_all %>%
+    filter(group_split == "a_hi_both") %>%
+    pull(symbol_human) %>%
+    unique(),
+  `High in human` = jf_plt_all %>%
+    filter(group_split == "b_hi_hs") %>%
+    pull(symbol_human) %>%
+    unique(),
+  `High in mouse` = jf_plt_all %>%
+    filter(group_split == "c_hi_mm") %>%
+    pull(symbol_human) %>%
+    unique(),
+  `Non mappable human` = jf_plt_all %>%
+    filter(group_split == "d_not_mappable_human") %>%
+    pull(symbol_human) %>%
+    unique(),
+  `Non mappable mouse` = jf_plt_all %>%
+    filter(group_split == "d_not_mappable_mouse") %>%
+    pull(symbol_mouse) %>%
+    unique()
+)
+
+enrich_set <- function(set, description, library) {
+  query <- add_enrichr(set, description)
+  res_df <- get_enrichr_df(query, library)
+  
+  return(res_df)
+}
+
+go_bp_res <- lapply(seq_along(set_list), function(i) {
+  set <- set_list[[i]]
+  name <- names(set_list)[[i]]
+  
+  res_df <- enrich_set(set, name, "GO_Biological_Process_2021")
+})
+names(go_bp_res) <- paste0(names(set_list), "__GO_BP")
+
+saveRDS(go_bp_res, "data/processed/addition_fig3c.rds")
+```

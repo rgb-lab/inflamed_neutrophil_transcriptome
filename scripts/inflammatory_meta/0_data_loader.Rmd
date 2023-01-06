@@ -1,0 +1,434 @@
+---
+title: "Data loader"
+author: "NSH"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r, message=FALSE, include=FALSE}
+if (!require(readxl)) install.packages("readxl")
+if (!require(tidyverse)) install.packages("tidyverse")
+if (!require(BiocManager)) install.packages("BiocManager")
+if (!require(SummarizedExperiment)) BiocManager::install("SummarizedExperiment")
+if (!require(biomaRt)) BiocManager::install("biomaRt")
+
+source("scripts/utils/utils.R")
+```
+
+# Load data
+
+The below chunk loads the pipeline outputs from nf-core as SummarizedExperiment.
+Additionally, ensembl databases for human and mouse are retrieved.
+
+```{r}
+salmon_se_hs <- readRDS("data/raw_data/salmon/Hs_inflamm_salmon.merged.gene_counts_length_scaled.rds")
+salmon_se_mm <- readRDS("data/raw_data/salmon/Mm_inflamm_salmon.merged.gene_counts_length_scaled.rds")
+
+ensembl_human <- useEnsembl(biomart="ensembl", dataset="hsapiens_gene_ensembl", version = 107)
+ensembl_mouse <- useEnsembl(biomart="ensembl", dataset="mmusculus_gene_ensembl", version = 107)
+# rownames(arch_hs_se) <- rowData(arch_hs_se)$gene_name
+```
+
+Here, metadata is loaded, QC failing samples are removed and the SummarizedExperiment objects are updated accordingly.
+
+```{r}
+# load data
+coldata_cross_updated <- data.frame(
+  read_xlsx("./data/metadata/arch_annotation.xlsx",na = "NA", sheet = "inflammatory_comps"))
+
+# take care of identical entries for with multiple runs per experiment
+coldata_cross_updated <- coldata_cross_updated[!duplicated(coldata_cross_updated$SRX_accession),]
+rownames(coldata_cross_updated) <- coldata_cross_updated$SRX_accession
+
+coldata_cross_updated[["inflammatory_analysis"]] <- as.logical(coldata_cross_updated[["inflammatory_analysis"]])
+
+# split by species
+coldata_hs <- coldata_cross_updated[coldata_cross_updated[["species"]] == "Hs",]
+coldata_mm <- coldata_cross_updated[coldata_cross_updated[["species"]] == "Mm",]
+
+# match the order
+coldata_hs <- coldata_hs[colnames(salmon_se_hs), ]
+coldata_mm <- coldata_mm[colnames(salmon_se_mm), ]
+
+# check if colnames of assay match rownames of colData
+if (any(!rownames(coldata_hs) == colnames(assay(salmon_se_hs))) |
+    any(!rownames(coldata_mm) == colnames(assay(salmon_se_mm)))) {
+      warning ("ColData mismatch. Result most likely corrupted")
+}
+
+# remove QC failing samples
+failed_samples <- c("SRX5391730",
+                    "SRX5391731",
+                    "SRX5391732",
+                    "SRX5391733",
+                    "SRX5391734",
+                    "SRX5391735")
+
+all_hs_samples <- rownames(coldata_hs)
+ok_samples <- setdiff(all_hs_samples, failed_samples)
+
+coldata_hs <- coldata_hs[ok_samples, ]
+salmon_se_hs <- salmon_se_hs[, ok_samples]
+
+stopifnot(all(rownames(coldata_hs) == colnames(salmon_se_hs)))
+stopifnot(all(!failed_samples %in% rownames(coldata_hs)))
+stopifnot(all(ok_samples %in% rownames(coldata_hs)))
+```
+
+
+# Gene mapping and filtering
+
+The below code performs a mapping step to update each gene's primary identifier 
+to symbols. Additionally genes are subset to only include protein coding genes.
+
+```{r}
+###############################
+# ENSEMBL MAPPING + FILTERING #
+###############################
+
+#########
+# HUMAN #
+#########
+
+# RETRIEVE ENSEMBL DATA
+# ensembl dbs have been retrieved above
+
+# define the information to query from biomart
+attributes_human_query <- c(
+  "ensembl_gene_id",
+  "external_gene_name"
+)
+
+# retrieve biomart information on protein coding genes
+protein_coding_genes_human <- getBM(attributes = attributes_human_query,
+                              filters = c("biotype"),
+                              values = list("protein_coding"),
+                              mart = ensembl_human)
+# COUNTS
+# filter ENSEMBL IDs for protein coding genes
+ensembl_counts_human_pc <- assay(salmon_se_hs, "counts") %>%
+  as.data.frame() %>%
+  rownames_to_column("ensembl_gene_id") %>%
+  mutate(ensembl_gene_id = str_remove(ensembl_gene_id, "\\..*$")) %>%
+  filter(ensembl_gene_id %in% protein_coding_genes_human$ensembl_gene_id) %>%
+  column_to_rownames("ensembl_gene_id")
+
+# filter and map to genenames
+gene_counts_human_pc <- assay(salmon_se_hs, "counts") %>%
+  as.data.frame() %>%
+  rownames_to_column("ensembl_gene_id") %>%
+  mutate(ensembl_gene_id = str_remove(ensembl_gene_id, "\\..*$")) %>%
+  # join (inner join includes filtering) and remove empty symbols
+  inner_join(protein_coding_genes_human %>%
+               filter(external_gene_name != ""),
+             by = "ensembl_gene_id") %>%
+  # handle ambiguously mapped genes
+  group_by(ensembl_gene_id) %>%
+  mutate(n_gene_per_ensembl = length(external_gene_name)) %>%
+  group_by(external_gene_name) %>%
+  mutate(n_ensembl_per_gene = length(ensembl_gene_id)) %>%
+  ungroup() %>%
+  # remove genes with ensembl id mapping to multiple or no genes
+  filter(n_gene_per_ensembl == 1) %>%
+  # take the sum of symbols that have multiple corresponding ensembl genes
+  pivot_longer(cols = -c("ensembl_gene_id",
+                         "external_gene_name",
+                         "n_gene_per_ensembl",
+                         "n_ensembl_per_gene"),
+               names_to = "sample",
+               values_to = "counts") %>%
+  group_by(external_gene_name, sample) %>%
+  mutate(counts_sum = sum(counts)) %>%
+  dplyr::select(external_gene_name, sample, counts_sum) %>%
+  distinct() %>%
+  pivot_wider(id_cols = c("external_gene_name"),
+              values_from = "counts_sum",
+              names_from = "sample") %>%
+  arrange(external_gene_name) %>%
+  column_to_rownames("external_gene_name")
+
+
+# ABUNDANCE
+# filter ENSEMBL IDs for protein coding genes
+ensembl_abundance_human_pc <- assay(salmon_se_hs, "abundance") %>%
+  as.data.frame() %>%
+  rownames_to_column("ensembl_gene_id") %>%
+  mutate(ensembl_gene_id = str_remove(ensembl_gene_id, "\\..*$")) %>%
+  filter(ensembl_gene_id %in% protein_coding_genes_human$ensembl_gene_id) %>%
+  column_to_rownames("ensembl_gene_id")
+
+# filter and map to genenames
+gene_abundance_human_pc <- assay(salmon_se_hs, "abundance") %>%
+  as.data.frame() %>%
+  rownames_to_column("ensembl_gene_id") %>%
+  mutate(ensembl_gene_id = str_remove(ensembl_gene_id, "\\..*$")) %>%
+  # join (inner join includes filtering) and remove empty symbols
+  inner_join(protein_coding_genes_human %>%
+               filter(external_gene_name != ""),
+             by = "ensembl_gene_id") %>%
+  # handle ambiguously mapped genes
+  group_by(ensembl_gene_id) %>%
+  mutate(n_gene_per_ensembl = length(external_gene_name)) %>%
+  group_by(external_gene_name) %>%
+  mutate(n_ensembl_per_gene = length(ensembl_gene_id)) %>%
+  ungroup() %>%
+  # remove genes with ensembl id mapping to multiple or no genes
+  filter(n_gene_per_ensembl == 1) %>%
+  # take the sum of symbols that have multiple corresponding ensembl genes
+  pivot_longer(cols = -c("ensembl_gene_id",
+                         "external_gene_name",
+                         "n_gene_per_ensembl",
+                         "n_ensembl_per_gene"),
+               names_to = "sample",
+               values_to = "abundance") %>%
+  group_by(external_gene_name, sample) %>%
+  mutate(abundance_sum = sum(abundance)) %>%
+  dplyr::select(external_gene_name, sample, abundance_sum) %>%
+  distinct() %>%
+  pivot_wider(id_cols = c("external_gene_name"),
+              values_from = "abundance_sum",
+              names_from = "sample") %>%
+  arrange(external_gene_name) %>%
+  column_to_rownames("external_gene_name")
+
+
+rowdata_hs <- protein_coding_genes_human %>%
+  filter(external_gene_name != "",
+         external_gene_name %in% rownames(gene_counts_human_pc),
+         ensembl_gene_id %in% str_remove(rownames(ensembl_counts_human_pc), "\\..*")) %>%
+  group_by(external_gene_name) %>%
+  summarise(mapped_ensembl_ids = paste(ensembl_gene_id, collapse = ", "),
+            n_mapped = n()) %>%
+  ungroup() %>%
+  arrange(external_gene_name) %>%
+  DataFrame()
+
+stopifnot(all(rownames(gene_counts_human_pc) == rowdata_hs$external_gene_name))
+stopifnot(all(rownames(gene_abundance_human_pc) == rowdata_hs$external_gene_name))
+
+stopifnot(all(colnames(gene_counts_human_pc) == rownames(coldata_hs)))
+stopifnot(all(colnames(gene_abundance_human_pc) == rownames(coldata_hs)))
+
+salmon_se_hs_symbol <- SummarizedExperiment(
+  assays = list(counts = gene_counts_human_pc,
+                abundance = gene_abundance_human_pc),
+  colData = coldata_hs,
+  rowData = rowdata_hs
+)
+
+
+#########
+# MOUSE #
+#########
+
+# RETRIEVE ENSEMBL DATA
+# ensembl dbs have been retrieved above
+
+# define the information to query from biomart
+attributes_mouse_query <- c(
+  "ensembl_gene_id",
+  "external_gene_name"
+)
+
+# retrieve biomart information on protein coding genes
+protein_coding_genes_mouse <- getBM(attributes = attributes_mouse_query,
+                              filters = c("biotype"),
+                              values = list("protein_coding"),
+                              mart = ensembl_mouse)
+
+# COUNTS
+# filter ENSEMBL IDs for protein coding genes
+ensembl_counts_mouse_pc <- assay(salmon_se_mm, "counts") %>%
+  as.data.frame() %>%
+  rownames_to_column("ensembl_gene_id") %>%
+  mutate(ensembl_gene_id = str_remove(ensembl_gene_id, "\\..*$")) %>%
+  filter(ensembl_gene_id %in% protein_coding_genes_mouse$ensembl_gene_id) %>%
+  column_to_rownames("ensembl_gene_id")
+
+# filter and map to genenames
+gene_counts_mouse_pc <- assay(salmon_se_mm, "counts") %>%
+  as.data.frame() %>%
+  rownames_to_column("ensembl_gene_id") %>%
+  mutate(ensembl_gene_id = str_remove(ensembl_gene_id, "\\..*$")) %>%
+  # join (inner join includes filtering) and remove empty symbols
+  inner_join(protein_coding_genes_mouse %>%
+               filter(external_gene_name != ""),
+             by = "ensembl_gene_id") %>%
+  # handle ambiguously mapped genes
+  group_by(ensembl_gene_id) %>%
+  mutate(n_gene_per_ensembl = length(external_gene_name)) %>%
+  group_by(external_gene_name) %>%
+  mutate(n_ensembl_per_gene = length(ensembl_gene_id)) %>%
+  ungroup() %>%
+  # remove genes with ensembl id mapping to multiple or no genes
+  filter(n_gene_per_ensembl == 1) %>%
+  # take the sum of symbols that have multiple corresponding ensembl genes
+  pivot_longer(cols = -c("ensembl_gene_id",
+                         "external_gene_name",
+                         "n_gene_per_ensembl",
+                         "n_ensembl_per_gene"),
+               names_to = "sample",
+               values_to = "counts") %>%
+  group_by(external_gene_name, sample) %>%
+  mutate(counts_sum = sum(counts)) %>%
+  dplyr::select(external_gene_name, sample, counts_sum) %>%
+  distinct() %>%
+  pivot_wider(id_cols = c("external_gene_name"),
+              values_from = "counts_sum",
+              names_from = "sample") %>%
+  arrange(external_gene_name) %>%
+  column_to_rownames("external_gene_name")
+
+
+# ABUNDANCE
+# filter ENSEMBL IDs for protein coding genes
+ensembl_abundance_mouse_pc <- assay(salmon_se_mm, "abundance") %>%
+  as.data.frame() %>%
+  rownames_to_column("ensembl_gene_id") %>%
+  mutate(ensembl_gene_id = str_remove(ensembl_gene_id, "\\..*$")) %>%
+  filter(ensembl_gene_id %in% protein_coding_genes_mouse$ensembl_gene_id) %>%
+  column_to_rownames("ensembl_gene_id")
+
+# filter and map to genenames
+gene_abundance_mouse_pc <- assay(salmon_se_mm, "abundance") %>%
+  as.data.frame() %>%
+  rownames_to_column("ensembl_gene_id") %>%
+  mutate(ensembl_gene_id = str_remove(ensembl_gene_id, "\\..*$")) %>%
+  # join (inner join includes filtering) and remove empty symbols
+  inner_join(protein_coding_genes_mouse %>%
+               filter(external_gene_name != ""),
+             by = "ensembl_gene_id") %>%
+  # handle ambiguously mapped genes
+  group_by(ensembl_gene_id) %>%
+  mutate(n_gene_per_ensembl = length(external_gene_name)) %>%
+  group_by(external_gene_name) %>%
+  mutate(n_ensembl_per_gene = length(ensembl_gene_id)) %>%
+  ungroup() %>%
+  # remove genes with ensembl id mapping to multiple or no genes
+  filter(n_gene_per_ensembl == 1) %>%
+  # take the sum of symbols that have multiple corresponding ensembl genes
+  pivot_longer(cols = -c("ensembl_gene_id",
+                         "external_gene_name",
+                         "n_gene_per_ensembl",
+                         "n_ensembl_per_gene"),
+               names_to = "sample",
+               values_to = "abundance") %>%
+  group_by(external_gene_name, sample) %>%
+  mutate(abundance_sum = sum(abundance)) %>%
+  dplyr::select(external_gene_name, sample, abundance_sum) %>%
+  distinct() %>%
+  pivot_wider(id_cols = c("external_gene_name"),
+              values_from = "abundance_sum",
+              names_from = "sample") %>%
+  arrange(external_gene_name) %>%
+  column_to_rownames("external_gene_name")
+
+
+rowdata_mm <- protein_coding_genes_mouse %>%
+  filter(external_gene_name != "",
+         external_gene_name %in% rownames(gene_counts_mouse_pc),
+         ensembl_gene_id %in% str_remove(rownames(ensembl_counts_mouse_pc), "\\..*")) %>%
+  group_by(external_gene_name) %>%
+  summarise(mapped_ensembl_ids = paste(ensembl_gene_id, collapse = ", "),
+            n_mapped = n()) %>%
+  ungroup() %>%
+  arrange(external_gene_name) %>%
+  DataFrame()
+
+coldata_hs <- colData(salmon_se_mm) 
+
+stopifnot(all(rownames(gene_counts_mouse_pc) == rowdata_mm$external_gene_name))
+stopifnot(all(rownames(gene_abundance_mouse_pc) == rowdata_mm$external_gene_name))
+
+stopifnot(all(colnames(gene_counts_mouse_pc) == rownames(coldata_mm)))
+stopifnot(all(colnames(gene_abundance_mouse_pc) == rownames(coldata_mm)))
+
+salmon_se_mm_symbol <- SummarizedExperiment(
+  assays = list(counts = gene_counts_mouse_pc,
+                abundance = gene_abundance_mouse_pc),
+  colData = coldata_mm,
+  rowData = rowdata_mm
+)
+```
+
+Here, samples from the correct tissues and conditions are selected for subsequent analyses.
+
+```{r}
+# filter to only include samples that will be used
+# this includes: all inflammatory comp studies
+# HC samples from either BM or PB from additional studies (non-inflammatory-comp)
+
+salmon_se_hs_symbol_used <- salmon_se_hs_symbol[
+  ,
+  salmon_se_hs_symbol$inflammatory_analysis |
+    (salmon_se_hs_symbol$origin_tissue %in% c("PB", "BM") & salmon_se_hs_symbol$condition == "HC")
+]
+salmon_se_mm_symbol_used <- salmon_se_mm_symbol[
+  ,
+  salmon_se_mm_symbol$inflammatory_analysis |
+    (salmon_se_mm_symbol$origin_tissue %in% c("PB", "BM") & salmon_se_mm_symbol$condition == "HC")
+]
+
+
+# write coldata as meta table
+coldata_hs_used <- salmon_se_hs_symbol_used %>%
+  colData() %>%
+  as_tibble()
+
+coldata_mm_used <- salmon_se_mm_symbol_used %>%
+  colData() %>%
+  as_tibble()
+
+write_tsv(
+  coldata_hs_used,
+  "data/metadata/table_S4_human.tsv"
+)
+write_tsv(
+  coldata_mm_used,
+  "data/metadata/table_S4_mouse.tsv"
+)
+
+# write summary files
+coldata_hs_summary <- coldata_hs_used %>%
+  group_by(study_id) %>%
+  summarise(
+    n = n(),
+    inflammatory_analysis = unique(inflammatory_analysis),
+    conds = paste(
+      unique(
+        paste0(origin_tissue, "_" ,condition)
+        ),
+      collapse = ", ")
+    )
+write_tsv(
+  coldata_hs_summary,
+  "data/metadata/summary_S1_human.tsv"
+)
+
+coldata_mm_summary <- coldata_mm_used %>%
+  group_by(study_id) %>%
+  summarise(
+    n = n(),
+    inflammatory_analysis = unique(inflammatory_analysis),
+    conds = paste(
+      unique(
+        paste0(origin_tissue, "_" ,condition)
+        ),
+      collapse = ", ")
+    )
+write_tsv(
+  coldata_mm_summary,
+  "data/metadata/summary_S1_mouse.tsv"
+)
+```
+
+
+# Save processed data for downstream use
+
+```{r}
+saveRDS(salmon_se_hs_symbol_used, "data/processed/arch_hs_se.rds")
+saveRDS(salmon_se_mm_symbol_used, "data/processed/arch_mm_se.rds")
+```

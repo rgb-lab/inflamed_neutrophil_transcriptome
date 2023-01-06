@@ -1,0 +1,255 @@
+---
+title: "Profiling of inflammatory DE testing using LMM"
+author: "NSH"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r message=FALSE, include=FALSE}
+if (!require(tidyverse)) install.packages("tidyverse")
+if (!require(magrittr)) install.packages("magrittr")
+if (!require(ggplot2)) install.packages("ggplot2")
+if (!require(RColorBrewer)) install.packages("RColorBrewer")
+
+if (!require(BiocManager)) install.packages("BiocManager")
+if (!require(DESeq2)) BiocManager::install("DESeq2")
+if (!require(vsn)) BiocManager::install("vsn")
+if (!require(ComplexHeatmap)) BiocManager::install("ComplexHeatmap")
+if (!require(circlize)) BiocManager::install("circlize")
+if (!require(sva)) BiocManager::install("sva")
+if (!require(edgeR)) BiocManager::install("edgeR")
+if (!require(qvalue)) BiocManager::install("qvalue")
+
+# import color palettes
+source("scripts/utils/utils.R")
+source("scripts/utils/figure_builder.R")
+```
+
+```{r include=FALSE}
+cross_se <- readRDS("data/processed/cross_se.rds")
+cross_se_inflammatory <- cross_se[, cross_se$inflammatory_analysis]
+
+load("data/processed/LMM_res_composite.rda")
+up_genes <- model_res_df %>%
+  filter(adj_Pvalue < 0.05,
+         Beta >= 1) %>%
+  pull(symbol)
+dn_genes <- model_res_df %>%
+  filter(adj_Pvalue < 0.05,
+         Beta <= -1) %>%
+  pull(symbol)
+
+p_df <- readRDS("data/processed/fisher_p_df.rds")
+lfc_df <- readRDS("data/processed/fisher_lfc_df.rds")
+p_lfc_df <- readRDS("data/processed/fisher_p_lfc_df.rds")
+
+```
+
+# LFC heatmaps
+
+```{r}
+heatmap_matrix <- lfc_df %>%
+  filter (symbol %in% c(up_genes, dn_genes)) %>%
+  #filter(symbol %in% sig_genes) %>%
+  pivot_longer(!symbol, names_to = "study", values_to = "lfc") %>%
+  group_by(symbol) %>%
+  filter(!any(is.na(lfc))) %>%
+  mutate(median = median(lfc)) %>%
+  ungroup() %>%
+  arrange(median) %>%
+  pivot_wider(id_cols = c(study), names_from = symbol, values_from = lfc) %>%
+  mutate(study = str_remove(study, "lfc__")) %>%
+  mutate(study = str_remove(study, "_vs_HC")) %>%
+  column_to_rownames("study") %>%
+  as.matrix()
+
+heatmap_matrix_scaled <- lfc_df %>%
+  filter (symbol %in% c(up_genes, dn_genes)) %>%
+  pivot_longer(!symbol, names_to = "study", values_to = "lfc") %>%
+  group_by(study) %>%
+  mutate(lfc_scaled = scale(lfc)) %>%
+  group_by(symbol) %>%
+  filter(!any(is.na(lfc_scaled))) %>%
+  mutate(median = median(lfc_scaled)) %>%
+  ungroup() %>%
+  arrange(median) %>%
+  pivot_wider(id_cols = c(study), names_from = symbol, values_from = lfc_scaled) %>%
+  mutate(study = str_remove(study, "lfc__")) %>%
+  mutate(study = str_remove(study, "_vs_HC")) %>%
+  column_to_rownames("study") %>%
+  as.matrix()
+
+# saveRDS(heatmap_matrix, "data/processed/data_fig_4c_1.rds")
+# saveRDS(heatmap_matrix_scaled, "data/processed/data_fig_4c_2.rds")
+```
+
+```{r}
+# no row scaling
+fig_3c_1 <- build_fig_3c_1()
+# row scaling
+fig_3c_2 <- build_fig_3c_2()
+
+fig_3c_1
+fig_3c_2
+```
+
+# LFC surfaceome heatmap
+
+Filter for surfaceome using https://wlab.ethz.ch/surfaceome/ Cite: Bausch-Fluck et al. 2018 PNAS
+
+
+Heatmap of filtered genes: LFC of gene per study
+
+```{r}
+surfaceome_data <- read_csv("data/metadata/table_S3_surfaceome.csv")
+
+plt_surfaceome <- heatmap_matrix[ , colnames(heatmap_matrix) %in% surfaceome_data$`UniProt gene`]
+```
+
+
+# Expression heatmaps
+
+```{r}
+log2tpm <- cross_se_inflammatory[c(up_genes, dn_genes), ] %>%
+  assay(., "abundance") %>%
+  `+`(1) %>%
+  log2()
+
+order_df <- cross_se_inflammatory %>%
+  colData() %>%
+  as.data.frame() %>%
+  mutate(condition = ifelse(condition == "HC", "HC", "INFL")) %>%
+  arrange(condition, species) %>%
+  dplyr::transmute(sample = SRX_accession,
+                   condition,
+                   species)
+
+generank <- log2tpm %>%
+  rownames_to_column("symbol") %>%
+  pivot_longer(cols = -symbol,
+               names_to = "sample",
+               values_to = "tpm") %>%
+  left_join(order_df, by = "sample") %>%
+  filter(condition == "HC") %>%
+  group_by(symbol) %>%
+  summarise(HC_tpm = mean(tpm)) %>%
+  arrange(desc(HC_tpm))
+
+anno <- columnAnnotation(condition = order_df$condition,
+                         species = order_df$species)
+
+log2tpm_scaled <- log2tpm %>%
+  t() %>%
+  scale() %>%
+  t()
+
+Heatmap(log2tpm_scaled[generank$symbol, order_df$sample],
+        show_column_names = F,
+        show_row_names = F,
+        cluster_columns = F,
+        cluster_rows = F,
+        top_annotation = anno)
+```
+
+```{r}
+series <- factor(colData(cross_se_inflammatory)[["series"]])
+expr <- as.matrix(assay(cross_se_inflammatory, "counts"))
+expr_corrected <- ComBat_seq(expr, series)
+
+expr_corrected_norm <- calcNormFactors(DGEList(expr_corrected), method = "TMM")
+lcpm <- edgeR::cpm(expr_corrected_norm, log = TRUE)
+```
+
+```{r}
+order_df <- cross_se_inflammatory %>%
+  colData() %>%
+  as.data.frame() %>%
+  mutate(condition = ifelse(condition == "HC", "HC", "INFL")) %>%
+  arrange(condition, species) %>%
+  dplyr::transmute(sample = SRX_accession,
+                   condition,
+                   species)
+
+lcpm_scaled <- lcpm %>%
+  t() %>%
+  scale() %>%
+  t()
+
+generank <- lcpm_scaled[c(up_genes, dn_genes), ] %>%
+  as.data.frame() %>%
+  rownames_to_column("symbol") %>%
+  pivot_longer(cols = -symbol,
+               names_to = "sample",
+               values_to = "tpm") %>%
+  left_join(order_df, by = "sample") %>%
+  filter(condition == "HC") %>%
+  group_by(symbol) %>%
+  summarise(HC_tpm = mean(tpm)) %>%
+  arrange(desc(HC_tpm))
+
+anno <- columnAnnotation(condition = order_df$condition,
+                         species = order_df$species)
+
+
+
+Heatmap(lcpm_scaled[generank$symbol, order_df$sample],
+        show_column_names = F,
+        show_row_names = F,
+        cluster_columns = F,
+        cluster_rows = F,
+        top_annotation = anno)
+```
+
+# Reproducibility analysis of LMM results
+
+First check significant events of LMM in fisher composite.
+
+```{r}
+sig_fisher_events <- p_df %>%
+  filter(symbol %in% c(up_genes, dn_genes))
+lmm_fisher_q <- qvalue(sig_fisher_events %>% pull(fisher, symbol))
+lmm_fisher_pi1 <- 1-lmm_fisher_q$pi0
+
+save(sig_fisher_events, lmm_fisher_q, lmm_fisher_pi1, file = "data/processed/lmm_fisher_reproducibility.rda")
+```
+
+Then check LMM hits in individual study results.
+
+```{r}
+res_list <- readRDS("data/processed/de_seq_res_list.rds")
+
+lmm_individual_reproducibility <- lapply(seq_along(res_list), function (i) {
+  res <- res_list[[i]]
+  name <- names(res_list)[[i]]
+  
+  sig_events <- res %>%
+    as.data.frame() %>%
+    rownames_to_column("symbol") %>%
+    filter(symbol %in% c(up_genes, dn_genes),
+           !is.na(pvalue)) %>%
+    dplyr::select(pvalue, symbol)
+  q <- qvalue(sig_events$pvalue)
+  pi1 <- 1-q$pi0
+  
+  return (list(comp = name, sig_events = sig_events, q_res = q, pi1 = pi1))
+})
+
+saveRDS(lmm_individual_reproducibility, "data/processed/lmm_individual_reproducibility.rds")
+```
+
+```{r}
+lapply (lmm_individual_reproducibility, function(res) {
+  comp <- res$comp
+  sig_events <- res$sig_events
+  q <- res$q_res
+  pi1 <- res$pi1
+  
+  ggplot(sig_events, aes(x = pvalue)) +
+    geom_histogram() +
+    ggtitle(paste("Pi1:", pi1, "n events:", nrow(sig_events), "Comp:", comp))
+  })
+```
+

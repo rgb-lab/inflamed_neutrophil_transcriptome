@@ -1,0 +1,12 @@
+study_id	n	inflammatory_analysis	conds
+Bhalla M 2021	7	FALSE	BM_HC
+Casulli J 2019	3	FALSE	BM_HC
+Coffelt SB 2014	4	FALSE	PB_HC
+de Graaf CA 2018	6	FALSE	BM_HC, PB_HC
+Gal-Oz ST 2019	12	TRUE	spleen_IFN, spleen_HC
+Germann M 2020	4	FALSE	PB_HC
+Hsu BE 2019	4	FALSE	BM_HC
+Hutchins AP 2015	4	TRUE	BM_HC, BM_LPS
+Stasulli NM 2015	6	TRUE	BM_HC, BM_Y.pestis
+Yan Z 2019	6	TRUE	BM_HC, BM_G.CSF
+Zhu YP 2018	3	FALSE	BM_HC

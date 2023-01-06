@@ -1,0 +1,45 @@
+---
+title: "MFI Plots"
+author: "NH"
+output: html_notebook
+---
+
+```{r setup}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r}
+if (!require(tidyverse)) install.packages("tidyverse")
+if (!require(ggplot2)) install.packages("ggplot2")
+if (!require(ggpubr)) install.packages("ggpubr")
+
+source("scripts/utils/figure_builder.R")
+```
+
+```{r}
+mfi_human <- read.delim("data/raw_data/experiments/human_MFIs.csv", sep = ";") %>%
+  pivot_longer(cols = -c("day", "condition", "donor"),
+               names_to = "marker",
+               values_to = "mfi") %>%
+  mutate(condition = factor(condition, levels = c("unstim", "GL", "GI")))
+mfi_mouse <- read.delim("data/raw_data/experiments/mouse_MFIs.csv", sep = ";")  %>%
+  pivot_longer(cols = -c("day", "condition", "donor"),
+               names_to = "marker",
+               values_to = "mfi") %>%
+  mutate(condition = factor(condition, levels = c("unstim", "GL", "GI")))
+
+saveRDS(mfi_human, "data/processed/data_fig_6c_1.rds")
+saveRDS(mfi_mouse, "data/processed/data_fig_6c_2.rds")
+```
+
+
+```{r}
+# pdf("figures/delete/mfi_plots.pdf",
+#     width = 10,
+#     height = 10*9/16)
+mfi_plt_human <- build_fig_6b_1()
+mfi_plt_mouse <- build_fig_6b_2()
+mfi_plt_human
+mfi_plt_mouse
+# dev.off()
+```

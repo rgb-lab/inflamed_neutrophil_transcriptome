@@ -1,0 +1,359 @@
+---
+title: "Haemopedia: Cross species lineage comparisons"
+author: "NSH"
+output: html_notebook
+---
+
+```{r setup}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r, message=FALSE}
+if (!require (tidyverse)) install.packages("tidyverse")
+if (!require (zeallot)) install.packages("zeallot")
+if (!require (ComplexHeatmap)) install.packages("ComplexHeatmap")
+if (!require (ggpubr)) install.packages("ggpubr")
+if (!require (gridExtra)) install.packages("gridExtra")
+if (!require (RColorBrewer)) install.packages("RColorBrewer")
+if (!require (reshape2)) install.packages("reshape2")
+if (!require (DESeq2)) install.packages("DESeq2")
+if (!require (edgeR)) install.packages("edgeR")
+if (!require (limma)) install.packages("limma")
+if (!require (circlize)) install.packages("circlize")
+if (!require (magick)) install.packages("magick")
+
+source("scripts/utils/figure_builder.R")
+```
+
+
+Load the data for downstream analysis
+```{r}
+cross_se <- readRDS("data/processed/haemopedia_salmon_cross_se.rds")
+```
+
+Preprocess gene expression for plotting.
+
+```{r}
+## PREPROCESS THE DATA ##
+dge_human <- SE2DGEList(cross_se[,cross_se$species == "Homo sapiens"])
+dge_human <- calcNormFactors(dge_human, method = "TMM")
+lcpm_human <- edgeR::cpm(dge_human,
+                         normalized.lib.sizes = TRUE,
+                         log = TRUE)
+
+dge_mouse <- SE2DGEList(cross_se[,cross_se$species == "Mus musculus"])
+dge_mouse <- calcNormFactors(dge_mouse, method = "TMM")
+lcpm_mouse <- edgeR::cpm(dge_mouse,
+                         normalized.lib.sizes = TRUE,
+                         log = TRUE)
+
+## MEAN CENTER FOR EACH SPECIES ##
+hs_cross_expr_centered <- lcpm_human %>%
+  t() %>%
+  scale(scale = FALSE) %>%
+  t()
+mm_cross_expr_centered <- lcpm_mouse %>%
+  t() %>%
+  scale(scale = FALSE) %>%
+  t()
+# hs_cross_expr_centered <- lcpm_human
+# mm_cross_expr_centered <- lcpm_mouse
+
+## ASSEMBLE JOINT MATRIX
+cross_expr_centered <- hs_cross_expr_centered %>%
+  as.data.frame() %>%
+  rownames_to_column("symbol") %>%
+  full_join(mm_cross_expr_centered %>%
+              as.data.frame() %>%
+              rownames_to_column("symbol"), by = "symbol") %>%
+  column_to_rownames("symbol")
+
+# non-centered data
+# CPM
+dge <- SE2DGEList(cross_se)
+dge <- calcNormFactors(dge, method = "TMM")
+cross_cpm <- edgeR::cpm(dge,
+                        normalized.lib.sizes = TRUE,
+                        log = TRUE) %>%
+  as.data.frame()
+# TPM
+cross_tpm <- log2(assay(cross_se, "abundance")+1)
+```
+
+# Definition of cross-species lineage specific genes
+
+## Clipped at 200 gene version
+
+```{r}
+define_lin_spec_genes <- function (SEobject) {
+  
+  colData(SEobject)[["lineage_clean"]] <- str_replace_all(colData(SEobject)[["lineage_clean"]], " ", "_")
+  
+  lineages <- SEobject %>%
+    colData() %>%
+    as.data.frame() %>%
+    pull(lineage_clean) %>%
+    unique() %>%
+    sort()
+  
+  lineage_genes <- lapply (lineages, function (cur_lin) {
+    
+    expr <- SEobject %>%
+      assay() %>%
+      as.data.frame()
+    coldata <- SEobject %>%
+      colData() %>%
+      as.data.frame()
+    
+    lineage_clean <- factor(
+      lineages,
+      levels = c(cur_lin, setdiff(lineages, cur_lin))
+    )
+    
+    design <- ~ 0 + lineage_clean
+    design_matrix <- model.matrix(design, data = coldata)
+    
+    contrasts <- expand.grid(cur_lin, setdiff(lineage_clean, cur_lin)) %>%
+      mutate (contr = paste(paste0("lineage_clean", Var1), paste0("lineage_clean", Var2), sep = "-")) %>%
+      pull (contr)
+    contrast_matrix <- makeContrasts(contrasts = contrasts,
+                                     levels = paste0("lineage_clean", lineage_clean))
+    
+    dge <- SE2DGEList(SEobject)
+    keep <- filterByExpr(dge, design_matrix)
+    dge <- dge[keep,,keep.lib.sizes=FALSE]
+    dge <- calcNormFactors(dge, method = "TMM")
+    
+    voom <- voom (dge,
+                  design = design_matrix,
+                  plot = TRUE)
+    
+    fit <- lmFit(voom, design = design_matrix)
+    fit2 <- contrasts.fit(fit, contrast_matrix)
+    efit <- eBayes(fit2)
+    #efit <- treat(fit2, lfc = 1.5)
+    
+    ttable <- topTable(efit, number = Inf) %>%
+      as.data.frame()
+    # genes <- ttable %>%
+    #   rownames_to_column("symbol") %>%
+    #   dplyr::pull(symbol, F)
+    
+    # no lfc here, instead treat with lfc
+    dt <- decideTests(efit#,
+                      #method = "global"
+                      )
+    #genes <- names(rowSums(dt)[rowSums(dt) == ncol(dt)])
+    dt_arranged <- dt %>%
+      as.data.frame() %>%
+      rownames_to_column("symbol") %>%
+      rowwise() %>%
+      mutate(sum = sum(c_across(!all_of("symbol")))) %>%
+      filter(sum == 5) %>%
+      left_join(ttable %>%
+                  rownames_to_column("symbol") %>%
+                  dplyr::select(symbol, `F`)) %>%
+      arrange(desc(sum), desc(`F`)) %>%
+      ungroup() %>%
+      mutate(rank = 1:length(sum)) %>%
+      slice_min(order_by = rank, n = 200)
+    
+    message("Sum last rank: ", dt_arranged$sum[200])
+    message("F last rank: ", dt_arranged$`F`[200])
+    
+    genes <- dt_arranged$symbol
+    
+    return (genes)
+    
+    
+  })
+  
+  if (all(unlist(lineage_genes) == unique(unlist(lineage_genes)))) {
+    message ("Exclusive lin genes.")
+  }
+  
+  names(lineage_genes) <- lineages
+  return (list (SEobject = SEobject,
+                lineage_genes = lineage_genes))
+  
+}
+```
+
+
+```{r}
+results <- define_lin_spec_genes(cross_se)
+```
+
+Clean obtained lineage specific genes.
+
+```{r}
+lin_spec_list <- lapply (names(results$lineage_genes), function (cur_lin) {
+  
+  set <- results$lineage_genes[[cur_lin]]
+  
+  return(data.frame(
+    gene = set,
+    lineage_orig = cur_lin
+  ))
+  
+})
+
+lin_spec_df <- Reduce(rbind, lin_spec_list) %>%
+  group_by(gene) %>%
+  mutate(marks = if(length(lineage_orig) > 1) "> 1" else lineage_orig) %>%
+  ungroup()
+
+gene_set_rank <- lin_spec_df %>%
+  group_by(marks) %>%
+  tally() %>%
+  arrange(desc(n)) %>%
+  mutate(marks = str_replace_all(marks, "_", " ")) %>%
+  pull(marks)
+```
+
+
+Plot lineage specific genes as heatmap.
+
+```{r}
+## SUMMARIZE PER SPECIES AND LINEAGE, ANNOTATE ##
+plt <- cross_expr_centered %>%
+  rownames_to_column("symbol") %>%
+  filter(symbol %in% lin_spec_df$gene) %>%
+  pivot_longer(cols = -"symbol",
+               names_to = "sample_id",
+               values_to = "count") %>%
+  left_join(cross_se %>%
+              colData() %>%
+              as.data.frame() %>%
+              rownames_to_column("sample_id") %>%
+              dplyr::select(sample_id, lineage_clean, species),
+            by = "sample_id") %>%
+  left_join(lin_spec_df %>%
+              dplyr::transmute(symbol = gene,
+                               marks),
+            by = "symbol") %>%
+  group_by(lineage_clean, species, symbol) %>%
+  summarise(mean_count_spec = mean(count),
+            marks) %>%
+  arrange(match(lineage_clean, gene_set_rank), species) %>%
+  distinct()
+  
+plt_ranking <- plt %>%
+  filter(marks == str_replace_all(lineage_clean," ", "_")) %>%
+  group_by(lineage_clean, symbol) %>%
+  summarise(mean_count = mean(mean_count_spec)) %>%
+  arrange(match(lineage_clean, gene_set_rank), desc(mean_count))
+  
+  
+plt_wide <- plt %>%
+  pivot_wider(names_from = c("lineage_clean", "species"),
+              values_from = "mean_count_spec") %>%
+  column_to_rownames("symbol") %>%
+  dplyr::select (-c(marks))
+plt_wide <- plt_wide[match(plt_ranking$symbol, rownames(plt_wide)), ]
+
+saveRDS(plt_ranking, "data/processed/data_1_fig_1c.rds")
+saveRDS(plt_wide, "data/processed/data_2_fig_1c.rds")
+```
+
+
+## Marker gene correlation
+### Heatmap
+
+```{r}
+cors_cross <- cross_expr_centered %>%
+  rownames_to_column("gene") %>%
+  filter(gene %in% lin_spec_df$gene) %>%
+  column_to_rownames("gene") %>%
+  cor(method = "pearson")
+
+annotation <- cross_se %>%
+  colData() %>%
+  as.data.frame() %>%
+  rownames_to_column("sample_id") %>%
+  arrange(match(sample_id, colnames(cors_cross)))
+
+saveRDS(cors_cross, "data/processed/data_1_fig_1d.rds")
+saveRDS(annotation, "data/processed/data_2_fig_1d.rds")
+```
+
+
+```{r}
+cross_pca <- cross_expr_centered %>%
+  rownames_to_column("gene") %>%
+  filter(gene %in% lin_spec_df$gene) %>%
+  column_to_rownames("gene") %>%
+  t() %>%
+  prcomp()
+
+# extract the variance explained
+pc1_var_expl <- round(
+  summary(cross_pca)[["importance"]]["Proportion of Variance", 1] * 100, 2)
+pc2_var_expl <- round(
+  summary(cross_pca)[["importance"]]["Proportion of Variance", 2] * 100, 2)
+
+# annotate the data for plotting
+plot_data <- cross_pca$x %>%
+  as.data.frame() %>%
+  rownames_to_column("sample") %>%
+  left_join(cross_se %>%
+              colData() %>%
+              as.data.frame() %>%
+              rownames_to_column("sample") %>%
+              dplyr::select(c(sample, lineage, species)), by = "sample")
+
+save(plot_data, pc1_var_expl, pc2_var_expl, file = "data/processed/data_fig_1b.rda")
+```
+Plot Figure 2a
+
+
+### Scatter
+
+```{r}
+plt_data <- cross_expr_centered %>%
+  rownames_to_column("symbol") %>%
+  pivot_longer(cols = -"symbol",
+               names_to = "sample_id",
+               values_to = "count") %>%
+  left_join(lin_spec_df %>%
+              transmute(symbol = gene,
+                        marks)) %>%
+  left_join(cross_se %>%
+              colData() %>%
+              as.data.frame() %>%
+              rownames_to_column("sample_id") %>%
+              dplyr::select(sample_id, lineage_clean, species)) %>%
+  filter(lineage_clean == str_replace_all(marks, "_", " ")) %>%
+  group_by(species, lineage_clean, symbol) %>%
+  summarise(mean_count = mean (count)) %>%
+  pivot_wider(names_from = "species",
+              values_from = mean_count) %>%
+  group_by(lineage_clean) %>%
+  mutate(density = get_density(`Homo sapiens`, `Mus musculus`, 15))
+
+saveRDS(plt_data, "data/processed/data_fig_1e.rds")
+```
+
+```{r}
+fig_1a <- build_fig_1a_3()
+fig_1a
+```
+
+```{r}
+fig_1d_1 <- build_fig_1d_1()
+
+fig_1d_1
+```
+
+```{r}
+fig_1e <- build_fig_1e()
+
+fig_1e
+```
+
+Plot Figure 2e.
+
+```{r fig.width=5, fig.height=5}
+fig_1f <- build_fig_1f()
+fig_1f
+```

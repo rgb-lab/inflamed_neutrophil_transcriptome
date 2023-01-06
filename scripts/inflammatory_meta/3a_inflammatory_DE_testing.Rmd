@@ -1,0 +1,178 @@
+---
+title: "Inflammatory DE testing"
+author: "NSH"
+output: html_notebook
+---
+
+```{r setup}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r, message=FALSE}
+if (!require(EnhancedVolcano)) install.packages("EnhancedVolcano")
+if (!require(gridExtra)) install.packages("gridExtra")
+
+if (!require(BiocManager)) install.packages("BiocManager")
+if (!require(DESeq2)) BiocManager::install("DESeq2")
+if (!require(apeglm)) BiocManager::install("apeglm")
+
+source("scripts/utils/utils.R")
+source("scripts/utils/figure_builder.R")
+```
+
+# Inflammatory DE testing
+
+This code performs differential expression testing for each selected study using DESeq2 and the lfcshrink algorithm.
+
+## Sample selection and metadata representation
+
+```{r}
+cross_se <- readRDS("data/processed/cross_se.rds")
+cross_se_inflammatory <- cross_se[, cross_se$inflammatory_analysis]
+```
+
+```{r}
+study_stats <- cross_se_inflammatory %>%
+  colData() %>%
+  as.data.frame() %>%
+  group_by(study_id) %>%
+  summarise(
+    species = unique(species),
+    n_stimuli = length(unique(condition[condition != "HC"])),
+    stimuli = paste(unique(condition[condition != "HC"]), collapse = ", "),
+    n_samp_resting = sum(condition == "HC"),
+    n_samp_stim = sum(condition != "HC"),
+    n_tissues = length(unique(origin_tissue)),
+    tissues = paste(unique(origin_tissue), collapse = ", "),
+    model = unique(model)
+    ) %>%
+  filter(n_stimuli != 0)
+
+
+saveRDS(study_stats, "data/processed/data_fig_4a.rds")
+```
+
+
+```{r}
+fig_3a_1 <- build_fig_3a_1()
+grid.draw(fig_3a_1)
+```
+
+
+### Experimental metadata representation
+
+```{r}
+fig_3a_2 <- build_fig_3a_2()
+fig_3a_2
+```
+
+
+## Perform the testing
+
+Having loaded the data, we can split our experiment into a list of experiments based on the study annotation.
+
+```{r}
+se_list <- split_se(cross_se_inflammatory, "series")[[1]]
+
+# only keep datasets with more than one experimental condition
+se_list_keep <- unlist(lapply(se_list, function (SEobject) return (length(unique(colData(SEobject)[["condition"]])) > 1)))
+
+se_list_filtered <- se_list[se_list_keep]
+
+for(i in 1:length(se_list_filtered)){
+  print(paste0(colData(se_list_filtered[[i]])$species[1], length(unique(rownames(colData(se_list_filtered[[i]]))))))
+}
+
+perform_de_seq <- function (SEobject) {
+  assays (SEobject) <- lapply(assays(SEobject), as.matrix)
+  # dds <- DESeqDataSet(SEobject, design = ~ condition)
+  dds <- DESeqDataSetFromMatrix(countData = round(assay(SEobject)),
+                                colData = colData(SEobject),
+                                rowData = rowData(SEobject),
+                                design = ~ condition)
+  # dds <- DESeqDataSetFromTximport(SEobject, design = ~ condition)
+  
+  if (!"HC" %in% levels(dds$condition)) {
+    stop ("\n[DESEQ WRAPPER] HC not present in dataset and cannot be used as reference level.\n")
+  }
+
+  message ("\n[DESEQ WRAPPER] HC present, using HC as reference level.\n")
+  dds$condition <- relevel(dds$condition, ref = "HC")
+  # Pre-filtering the dataset
+  nrow(dds)
+  keep <- rowSums(counts(dds)) > 1
+  dds <- dds[keep,]
+  nrow(dds)
+  
+  dds <- DESeq(dds)
+}
+
+dds_list <- lapply (se_list_filtered, perform_de_seq)
+```
+
+We can now use our list of dds Objects to extract the results for our comparisons of interest.
+
+```{r}
+extract_results <- function (dds) {
+  message ("[RES EXTRACT] Levels present in dataset: ", paste(levels(dds$condition), collapse = ", "))
+
+  if (length(levels(dds$condition)) > 2) {
+    message ("[RES EXTRACT] More than two pathological conditions found.")
+  }
+  cond_list <- as.list (setdiff(levels(dds$condition), "HC"))
+  # TODO: We might also want to add a unique study suffix such as GSE
+  species_list <- as.list(unique(dds$species))
+  # TODO: check naming (space vs _)
+  study_str <- unique (dds$study_id)
+  
+  if (length(study_str) != 1) {
+    warning ("[RES EXTRACT] More than one study present in dataset: ", paste(study_str, collapse = ", "))
+    study_str <- paste(study_str, collapse = "_")
+  }
+  
+  res_list <- lapply (cond_list, function (condition, dds, study_str) {
+    coef_str <- paste0("condition_", condition, "_vs_HC")
+    # TODO: coef vs. contrast
+    warning(print(study_str))
+    res <- lfcShrink(dds, coef = coef_str, type = "apeglm")
+  }, dds, study_str)
+  
+  names (res_list) <- paste0(study_str, "_condition_", as.character(cond_list), "_vs_HC_", species_list)
+  
+  return (res_list)
+  
+}
+
+res_list <- lapply (dds_list, extract_results)
+# flatten list
+res_list <- unlist (res_list)
+```
+
+## Plot the resulting volcanos
+
+```{r, fig.width=20, fig.height=25}
+plts <- lapply (seq_along(res_list), function(i, res_list) {
+  
+  ttable <- res_list[[i]]
+  
+  plt <- EnhancedVolcano(ttable,
+                         title = names(res_list)[[i]],
+                         lab = rownames(ttable),
+                         x = "log2FoldChange",
+                         y = "padj",
+                         pCutoff = 0.05,
+                         FCcutoff = 1)
+  }, res_list)
+#grid.arrange(grobs = plts)
+```
+
+```{r, fig.height=5, fig.width=3}
+lapply(plts, function(plt){plt})
+```
+
+
+Save the results.
+
+```{r}
+saveRDS(res_list, "data/processed/de_seq_res_list.rds")
+```

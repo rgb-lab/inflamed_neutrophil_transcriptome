@@ -1,0 +1,299 @@
+---
+title: "Inflammatory DE fisher metaanalysis"
+author: "NSH"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r, message=FALSE, include=FALSE}
+if (!require(tidyverse)) install.packages("tidyverse")
+if (!require(magrittr)) install.packages("magrittr")
+
+if (!require(BiocManager)) install.packages("BiocManager")
+if (!require(survcomp)) BiocManager::install("survcomp")
+```
+
+```{r include=FALSE}
+res_list <- readRDS("data/processed/de_seq_res_list.rds")
+```
+
+# Calculate summary stats
+
+Amount of differentially expressed genes per study...
+
+```{r}
+de_list <- lapply (seq_along(res_list), function (i) {
+  res <- res_list[[i]]
+  res %<>%
+    as.data.frame() %>%
+    filter(padj < 0.05) %>%
+    transmute(up = log2FoldChange > 0.5,
+              dn = log2FoldChange < -0.5,
+              group = ifelse(up, "up",
+                             ifelse(dn, "dn", "nc"))) %>%
+    group_by(group) %>%
+    tally() %>%
+    mutate(study = names(res_list)[[i]])
+})
+de_stats <- Reduce(function (df1, df2) rbind(df1, df2), de_list)
+```
+
+```{r}
+de_stats %<>%
+  pivot_wider(names_from = "group",
+              values_from = "n") %>%
+  group_by(study) %>%
+  mutate(sum = up + dn) %>%
+  ungroup() %>%
+  pivot_longer(cols = -"study",
+               names_to = "group", 
+               values_to = "n")
+
+message(median(de_stats %>% filter(group == "up") %>% pull(n)))
+message(median(de_stats %>% filter(group == "dn") %>% pull(n)))
+message(median(de_stats %>% filter(group == "sum") %>% pull(n)))
+```
+
+```{r}
+ggplot(de_stats, mapping = aes(x = group, y = n, color = group)) +
+  geom_boxplot() +
+  geom_jitter()
+```
+
+# Distribution of p vals per study
+
+```{r}
+lapply(seq_along(res_list), function(i) {
+  res <- res_list[[i]]
+  name <- names(res_list)[[i]]
+  
+  p_plt <- res %>%
+    as_tibble() %>%
+    ggplot(aes(x = pvalue)) +
+    geom_histogram() +
+    ggtitle(paste("p:", name)) +
+    theme(title = element_text(size = 10))
+  
+  padj_plt <- res %>%
+    as_tibble() %>%
+    ggplot(aes(x = padj)) +
+    geom_histogram() +
+    ggtitle(paste("padj:", name)) +
+    theme(title = element_text(size = 10))
+  
+  return(list(p_plt, padj_plt))
+  
+})
+```
+
+
+# Perform fisher meta analysis
+
+To perform our metaanlysis, we use a Fisher's combine test for all genes that are robustly expressed (based on DESeq2 filtering) in at least 80% of comparisons. In order to be able to do that, we first assemble a dataframe containing all said adjusted p values. The coverage filtering is done based on the NA values in this dataframe.
+
+```{r}
+p_list <- lapply (seq_along(res_list), function (i, res_list) {
+  
+  res <- as.data.frame(res_list[[i]]) %>%
+    rownames_to_column("symbol") %>%
+    dplyr::select(symbol, padj) #pvalue/padj
+
+  colnames(res) <- c("symbol", paste0("p__", names(res_list)[[i]]))
+  
+  return (res)
+  
+}, res_list)
+
+# assemble the dataframe
+p_df <- Reduce(function (df1, df2) merge.data.frame(df1, df2, by = "symbol"), p_list)
+
+# calculate the gene coverage
+na_df <- p_df %>%
+  column_to_rownames("symbol") %>%
+  is.na() %>%
+  as.data.frame() %>%
+  mutate(na_frac = rowSums(.)/ncol(.)) %>%
+  rownames_to_column("symbol") %>%
+  dplyr::select(c(symbol, na_frac))
+
+# define min coverage
+min_coverage <- 0.8
+
+# select genes based on min coverage
+selected_genes <- na_df %>%
+  filter (na_frac < 1 - min_coverage) %>%
+  pull (symbol)
+
+# subset the dataframe to the selected genes
+p_df_filtered <- p_df %>%
+  filter (symbol %in% selected_genes)
+```
+
+The above dataframe holds all adjusted P-Values from our DESeq2 differential expression testing which allows us, to perform Fisher's combine test on each row (ignoring all remaining NA values).
+
+```{r}
+# TODO: check/account for comparisons from the same study
+p_df_filtered[["fisher"]] <- apply(p_df_filtered %>% column_to_rownames("symbol"), 1, function (row) {
+  combine.test(row, method = "fisher", na.rm = TRUE)
+})
+```
+
+# Explore and adjust resulting pvals
+
+The above analysis yields a combined pvalue for each gene, but we have yet to account for multiple testing, which is the reason for this next section.
+
+```{r}
+p_df_filtered %>%
+  transmute(symbol = symbol, neglog_fisher = -log10(fisher)) %>%
+  ggplot(aes (x = neglog_fisher)) +
+  geom_density(fill = "yellow", alpha = 0.1)
+```
+
+# 
+
+```{r}
+p_df_filtered[["fisher_adjusted"]] <- p.adjust(p_df_filtered[["fisher"]], method = "BH")
+```
+
+```{r}
+p_df_filtered %>%
+  transmute(symbol = symbol, neglog_fisher = -log10(fisher), neglog_fisher_adjusted = -log10(fisher_adjusted)) %>%
+  pivot_longer(cols = c(neglog_fisher, neglog_fisher_adjusted), names_to = "method", values_to = "vals") %>%
+  ggplot(aes (x = vals, fill = method)) +
+  geom_histogram() +
+  facet_grid(method ~ .)
+```
+
+```{r}
+p_df_filtered %>%
+  pivot_longer(cols = c(fisher, fisher_adjusted), names_to = "method", values_to = "vals") %>%
+  ggplot(aes (x = vals, fill = method)) +
+  geom_histogram(binwidth = 0.1) +
+  facet_grid(method ~ .)
+```
+
+Based on the adjusted fisher p value, we can now extract the most significantly dysregulated genes from our data (and seperately up- and downregulated genes as well).
+
+```{r}
+sig_genes <- p_df_filtered %>%
+  slice_min(n = 500 ,order_by = fisher_adjusted, with_ties = FALSE) %>%
+  dplyr::pull(symbol)
+```
+
+# Compare effect sizes of significant genes
+
+We can now do the same thing, we did above for the adjusted p values for the log fold changes of all genes covered in at least 80% of the studies.
+
+```{r}
+lfc_list <- lapply (seq_along(res_list), function (i, res_list) {
+  
+  res <- as.data.frame(res_list[[i]]) %>%
+    rownames_to_column("symbol") %>%
+    dplyr::select(symbol, log2FoldChange)
+
+  colnames(res) <- c("symbol", paste0("lfc__", names(res_list)[[i]]))
+  
+  return (res)
+  
+}, res_list)
+
+lfc_df <- Reduce(function (df1, df2) merge.data.frame(df1, df2, by = "symbol"), lfc_list)
+```
+
+Lets now explore the lfcs of our signature genes.
+
+```{r}
+lfc_df %>%
+  filter (symbol %in% sig_genes) %>%
+  # mutate (mean_lfc = rowMeans(dplyr::select(., starts_with("lfc__")), na.rm = TRUE)) %>%
+  pivot_longer(cols = starts_with("lfc__"), names_to = "study", values_to = "lfc") %>%
+  ggplot (aes(x = lfc)) +
+  geom_density()
+```
+
+Our two summary dataframes can be merged into one dataframe containing the mean lfc and fisher gene for each study. Based on this information, we can define the most significantly up- and downregulated genes.
+
+```{r}
+p_lfc_df <- lfc_df %>%
+  column_to_rownames("symbol") %>%
+  mutate(mean_lfc = rowMeans(as.matrix(.))) %>%
+  rownames_to_column("symbol") %>%
+  dplyr::select(symbol, mean_lfc) %>%
+  right_join(p_df_filtered %>%
+               dplyr::select(symbol, fisher_adjusted), by = "symbol")
+```
+
+# Check p-rank relationship
+
+```{r}
+plt <- p_lfc_df %>%
+  arrange(fisher_adjusted) %>%
+  mutate(rank = 1:length(fisher_adjusted))
+
+ggplot (plt, aes (x = rank, y = -log10(fisher_adjusted))) +
+  geom_point() +
+  geom_vline(xintercept = 500)
+# ggplot (plt %>% filter(mean_lfc > 0), aes (x = rank, y = -log10(fisher_adjusted))) +
+#   geom_point() +
+#   geom_vline(xintercept = 250)
+# ggplot (plt %>% filter(mean_lfc < 0), aes (x = rank, y = -log10(fisher_adjusted))) +
+#   geom_point() +
+#   geom_vline(xintercept = 250)
+# ggplot (plt %>% filter(mean_lfc > 0.5), aes (x = rank, y = -log10(fisher_adjusted))) +
+#   geom_point() +
+#   geom_vline(xintercept = 250)
+# ggplot (plt %>% filter(mean_lfc < -0.5), aes (x = rank, y = -log10(fisher_adjusted))) +
+#   geom_point() +
+#   geom_vline(xintercept = 250)
+```
+
+# Define interesting genes
+
+```{r}
+# select the top hits
+fisher_hits <- p_lfc_df %>%
+  slice_min(n = 500, order_by = fisher_adjusted, with_ties = FALSE) %>%
+  filter(abs(mean_lfc) >= 0.5)
+
+# select the fisher up genes == inflammatory respnse core genes
+fisher_up_genes <- fisher_hits %>%
+  filter(mean_lfc > 0) %>%
+  pull(symbol)
+
+# select the fisher down genes
+fisher_dn_genes <- fisher_hits %>%
+  filter(mean_lfc < 0) %>%
+  pull(symbol)
+
+# map core genes to mouse for downstream use
+# Export mean(LFC) ranked core inflammatory signature for human and mouse 
+ortho_human_to_mouse <- readRDS("data/processed/ortho_human_to_mouse.rds")
+mapping <- ortho_human_to_mouse %>%
+  dplyr::select(external_gene_name, mmusculus_homolog_associated_gene_name) %>%
+  column_to_rownames("external_gene_name")
+
+fisher_up_genes_mouse <- mapping[fisher_up_genes, ]
+```
+
+
+```{r}
+saveRDS(p_df_filtered, "data/processed/fisher_p_df.rds")
+saveRDS(lfc_df, "data/processed/fisher_lfc_df.rds")
+saveRDS(p_lfc_df, "data/processed/fisher_p_lfc_df.rds")
+
+write_tsv(
+  p_lfc_df %>%
+    arrange(fisher_adjusted),
+  "data/processed/table_S2.tsv"
+)
+
+# balanced genes
+saveRDS(fisher_up_genes, "data/processed/fisher_up_genes.rds")
+saveRDS(fisher_dn_genes, "data/processed/fisher_dn_genes.rds")
+# core genes
+saveRDS(fisher_up_genes, "data/processed/up_fisher_human.rds")
+saveRDS(fisher_up_genes_mouse, "data/processed/up_fisher_mouse.rds")
+```

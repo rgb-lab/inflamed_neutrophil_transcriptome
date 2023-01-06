@@ -1,0 +1,211 @@
+---
+title: "Haemopedia: orthology mapping analyses."
+author: "NSH"
+output: html_notebook
+---
+
+```{r setup, include= FALSE}
+knitr::opts_chunk$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r include=FALSE}
+if (!require(ggplot2)) install.packages("ggplot2")
+if (!require(magrittr)) install.packages("magrittr")
+if (!require(tidyverse)) install.packages("tidyverse")
+
+if (!require(BiocManager)) install.packages("BiocManager")
+if (!require(biomaRt)) BiocManager::install("biomaRt")
+if (!require(SummarizedExperiment)) BiocManager::install("SummarizedExperiment")
+
+source("scripts/utils/figure_builder.R")
+```
+
+```{r include=FALSE}
+# in this notebook, we will load the filtered and symbol-identified data from the 
+# previously generated files (abbreviated to human and mouse _se for the ease of reading)
+human_se <-readRDS("data/processed/haemopedia_salmon_rpkm_se_hs.rds")
+mouse_se <-readRDS("data/processed/haemopedia_salmon_rpkm_se_mm.rds")
+
+ensembl_human <- useEnsembl(biomart="ensembl", dataset="hsapiens_gene_ensembl", version = 107)
+ensembl_mouse <- useEnsembl(biomart="ensembl", dataset="mmusculus_gene_ensembl", version = 107)
+```
+
+Retrieve ensembl information and subsequently perform orthology mapping for downstream use.
+
+```{r}
+#########################
+# MAPPING USING ENSEMBL #
+#########################
+# ensembl dbs have been retrieved above
+
+attributes_human_query <- c(
+  "ensembl_gene_id",
+  "external_gene_name",
+  "mmusculus_homolog_ensembl_gene",
+  "mmusculus_homolog_associated_gene_name",
+  "mmusculus_homolog_orthology_type",
+  "mmusculus_homolog_subtype",
+  "mmusculus_homolog_perc_id",
+  "mmusculus_homolog_goc_score",
+  "mmusculus_homolog_wga_coverage",
+  "mmusculus_homolog_orthology_confidence"
+)
+attributes_mouse_query <- c(
+  "ensembl_gene_id",
+  "external_gene_name",
+  "hsapiens_homolog_ensembl_gene",
+  "hsapiens_homolog_associated_gene_name",
+  "hsapiens_homolog_orthology_type",
+  "hsapiens_homolog_subtype",
+  "hsapiens_homolog_perc_id",
+  "hsapiens_homolog_goc_score",
+  "hsapiens_homolog_wga_coverage",
+  "hsapiens_homolog_orthology_confidence"
+)
+
+ortho_human_to_mouse <- getBM(attributes = attributes_human_query,
+                              filters = c("with_mmusculus_homolog", "biotype"),
+                              values = list(TRUE, "protein_coding"),
+                              mart = ensembl_human) %>%
+  filter(mmusculus_homolog_orthology_type == "ortholog_one2one",
+         mmusculus_homolog_orthology_confidence == 1,
+         external_gene_name != "",
+         mmusculus_homolog_associated_gene_name != "")
+
+ortho_mouse_to_human <- getBM(attributes = attributes_mouse_query,
+                              filters = c("with_hsapiens_homolog", "biotype"),
+                              values = list(TRUE, "protein_coding"),
+                              mart = ensembl_mouse) %>%
+  filter(hsapiens_homolog_orthology_type == "ortholog_one2one",
+         hsapiens_homolog_orthology_confidence == 1,
+         external_gene_name != "",
+         hsapiens_homolog_associated_gene_name != "")
+
+# some info about retrieved genes
+
+if (any(duplicated(ortho_human_to_mouse$ensembl_gene_id)) |
+    any(duplicated(ortho_human_to_mouse$external_gene_name)) |
+    any(duplicated(ortho_human_to_mouse$mmusculus_homolog_ensembl_gene)) |
+    any(duplicated(ortho_human_to_mouse$mmusculus_homolog_associated_gene_name))) {
+  warning("Duplicate gene identifiers in human ensembl query result")
+}
+if (any(duplicated(ortho_mouse_to_human$ensembl_gene_id)) |
+    any(duplicated(ortho_mouse_to_human$external_gene_name)) |
+    any(duplicated(ortho_mouse_to_human$mmusculus_homolog_ensembl_gene)) |
+    any(duplicated(ortho_mouse_to_human$mmusculus_homolog_associated_gene_name))) {
+  warning("Duplicate gene identifiers in mouse ensembl query result")
+}
+
+message("Retrieved ",
+        length(ortho_human_to_mouse$external_gene_name),
+        " human gene symbols mapping one2one to orthologous ",
+        "mouse genes with high confidence.")
+message("Retrieved ",
+        length(ortho_mouse_to_human$external_gene_name),
+        " mouse gene symbols mapping one2one to orthologous ",
+        "human genes with high confidence.")
+
+message("Human symbols in human query not present in mouse query: ",
+        paste(ortho_human_to_mouse$external_gene_name[
+          !ortho_human_to_mouse$external_gene_name %in%
+            ortho_mouse_to_human$hsapiens_homolog_associated_gene_name], collapse = ", "))
+message("Mouse symbols in human query not present in mouse query: ",
+        paste(ortho_human_to_mouse$mmusculus_homolog_associated_gene_name[
+          !ortho_human_to_mouse$mmusculus_homolog_associated_gene_name %in%
+            ortho_mouse_to_human$external_gene_name], collapse = ", "))
+
+message("Mouse symbols in mouse query not present in human query: ",
+        paste(ortho_mouse_to_human$external_gene_name[
+          !ortho_mouse_to_human$external_gene_name %in%
+            ortho_human_to_mouse$mmusculus_homolog_associated_gene_name], collapse = ", "))
+message("Human symbols in mouse query not present in human query: ",
+        paste(ortho_mouse_to_human$hsapiens_homolog_associated_gene_name[
+          !ortho_mouse_to_human$hsapiens_homolog_associated_gene_name %in%
+            ortho_human_to_mouse$external_gene_name], collapse = ", "))
+```
+
+
+# Mapping for downstream analyses
+
+Here, we map the mouse symbols to human symbols and join the human and mouse
+SummarizedExperiment objects.
+
+```{r}
+# coldata
+coldata_human <- human_se %>%
+  colData() %>%
+  as.data.frame()
+coldata_mouse <- mouse_se %>%
+  colData() %>%
+  as.data.frame()
+
+coldata_cross <- rbind(coldata_human, coldata_mouse)
+
+# maps mouse assays to human ensgenes and joins assays
+join_assays <- function(assay_name) {
+  
+  expr_human <- assay(human_se, assay_name) %>%
+    rownames_to_column("human_gene_name")
+  
+  expr_mouse <- assay(mouse_se, assay_name) %>%
+    rownames_to_column("mouse_gene_name")
+  
+  message("Mouse genes prior to joining: ", nrow(expr_mouse))
+  message("Human genes prior to joining: ", nrow(expr_human))
+  
+  expr_cross <- expr_mouse %>%
+    inner_join(ortho_mouse_to_human %>%
+      transmute(human_gene_name = hsapiens_homolog_associated_gene_name,
+                mouse_gene_name = external_gene_name),
+      by = "mouse_gene_name") %>%
+    inner_join(expr_human, by = "human_gene_name") %>%
+    arrange(human_gene_name) %>%
+    column_to_rownames("human_gene_name") %>%
+    dplyr::select(rownames(coldata_cross))
+  
+  message("Genes after joining: ", nrow(expr_cross))
+  
+  return (expr_cross)
+  
+}
+
+counts_cross<- join_assays("counts")
+tpm_cross <- join_assays("abundance")
+# rpkm_tmm_cross <- join_assays("rpkm_tmm")
+
+# rowdata
+rowdata_cross <- human_se %>%
+  rowData() %>%
+  as.data.frame() %>%
+  filter(external_gene_name %in% rownames(counts_cross)) %>%
+  arrange(external_gene_name)
+rownames(rowdata_cross) <- rowdata_cross$external_gene_name
+
+
+# some final checks
+stopifnot(all(rownames(rowdata_cross) == rownames(counts_cross)))
+stopifnot(all(rownames(rowdata_cross) == rownames(tpm_cross)))
+# stopifnot(all(rownames(rowdata_cross) == rownames(rpkm_tmm_cross)))
+
+stopifnot(all(colnames(counts_cross) == rownames(coldata_cross)))
+stopifnot(all(colnames(tpm_cross) == rownames(coldata_cross)))
+# stopifnot(all(colnames(rpkm_tmm_cross) == rownames(coldata_cross)))
+
+
+haemopedia_cross_se <- SummarizedExperiment(
+  assays = list(
+    counts = counts_cross,
+    abundance = tpm_cross#,
+    # rpkm_tmm = rpkm_tmm_cross
+  ),
+  colData = coldata_cross,
+  rowData = rowdata_cross
+)
+
+```
+
+Save file.
+
+```{r}
+saveRDS(haemopedia_cross_se, "data/processed/haemopedia_salmon_cross_se.rds")
+```

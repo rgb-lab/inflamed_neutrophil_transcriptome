@@ -1,0 +1,319 @@
+---
+title: "Analysis of Hoxb8-derived neutrophils, Zymosan treatment and TF-knockouts"
+author: "FR"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r message=FALSE, include=FALSE}
+if (!require(tidyverse)) install.packages("tidyverse")
+if (!require(magrittr)) install.packages("magrittr")
+if (!require(ggplot2)) install.packages("ggplot2")
+if (!require(RColorBrewer)) install.packages("RColorBrewer")
+if (!require(BiocManager)) install.packages("BiocManager")
+if (!require(DESeq2)) BiocManager::install("DESeq2")
+if (!require(vsn)) BiocManager::install("vsn")
+if (!require(ComplexHeatmap)) BiocManager::install("ComplexHeatmap")
+if (!require(circlize)) BiocManager::install("circlize")
+if (!require(biomaRt)) BiocManager::install("biomaRt")
+if (!require(goseq)) BiocManager::install("goseq")
+
+
+# import color palettes
+source("scripts/utils/utils.R")
+source("scripts/utils/figure_builder.R")
+```
+
+
+Load the data from GSE161765, and assign it to its metadata. Then filter it for protein coding genes and map to gene names.
+
+```{r}
+# Load the data
+cts <- read.delim("data/raw_data/zymosan/GSE161765_hoxb8_rna_1_featureCounts.txt", skip = 1)
+cts_2 <- read.delim("data/raw_data/zymosan/GSE161765_hoxb8_rna_2_featureCounts.txt", skip = 1)
+cts_3 <- read.delim("data/raw_data/zymosan/GSE161765_airpouch_rna_featureCounts.txt", skip = 1)
+# Create a standard count matrix
+cts %<>%
+  dplyr::select(-c("Chr", "Start", "End", "Strand", "Length")) %>%
+  column_to_rownames("Geneid")
+
+# Filter and map to gene names
+
+# RETRIEVE ENSEMBL DATA
+ensembl_mouse <- useEnsembl(biomart="ensembl", dataset="mmusculus_gene_ensembl", version = 107)
+
+# define the information to query from biomart
+attributes_mouse_query <- c(
+  "ensembl_gene_id",
+  "external_gene_name"
+)
+
+# retrieve biomart information on protein coding genes
+protein_coding_genes_mouse <- getBM(attributes = attributes_mouse_query,
+                                    filters = c("biotype"),
+                                    values = list("protein_coding"),
+                                    mart = ensembl_mouse)
+# COUNTS
+# filter ENSEMBL IDs for protein coding genes
+ensembl_counts_mouse_pc <- cts %>%
+  rownames_to_column("ensembl_gene_id") %>%
+  filter(ensembl_gene_id %in% protein_coding_genes_mouse$ensembl_gene_id) %>%
+  column_to_rownames("ensembl_gene_id")
+
+# filter and map to genenames
+cts %<>%
+  rownames_to_column("ensembl_gene_id") %>%
+  # join (inner join includes filtering) and remove empty symbols
+  inner_join(protein_coding_genes_mouse %>%
+               filter(external_gene_name != ""),
+             by = "ensembl_gene_id") %>%
+  # handle ambiguously mapped genes
+  group_by(ensembl_gene_id) %>%
+  mutate(n_gene_per_ensembl = length(external_gene_name)) %>%
+  group_by(external_gene_name) %>%
+  mutate(n_ensembl_per_gene = length(ensembl_gene_id)) %>%
+  ungroup() %>%
+  # remove genes with ensembl id mapping to multiple or no genes
+  filter(n_gene_per_ensembl == 1) %>%
+  # take the sum of symbols that have multiple corresponding ensembl genes
+  pivot_longer(cols = -c("ensembl_gene_id",
+                         "external_gene_name",
+                         "n_gene_per_ensembl",
+                         "n_ensembl_per_gene"),
+               names_to = "sample",
+               values_to = "counts") %>%
+  group_by(external_gene_name, sample) %>%
+  mutate(counts_sum = sum(counts)) %>%
+  dplyr::select(external_gene_name, sample, counts_sum) %>%
+  distinct() %>%
+  pivot_wider(id_cols = c("external_gene_name"),
+              values_from = "counts_sum",
+              names_from = "sample") %>%
+  arrange(external_gene_name) %>%
+  column_to_rownames("external_gene_name")
+```
+
+Load core inflammation genes.
+```{r}
+up_fisher_mouse <- readRDS("data/processed/up_fisher_mouse.rds")
+```
+
+
+Get sample N
+```{r}
+  coldata <- readxl::read_xlsx("data/metadata/GSE161765_rna.xlsx")
+  coldata %<>%
+    arrange(match(coldata$id, colnames(cts)))
+  
+  nrow(coldata[coldata$days_of_hoxb8_differentiation == "5",])
+```
+
+Routine to perform DESeq2.
+
+```{r}
+get_res <- function(GENOTYPE, COMPARISON, condition){
+  coldata <- readxl::read_xlsx("data/metadata/GSE161765_rna.xlsx")
+  coldata %<>%
+    arrange(match(coldata$id, colnames(cts)))
+  
+  if(COMPARISON == "treatment"){
+    dds <- DESeqDataSetFromMatrix(countData = cts,
+                                  colData = coldata,
+                                  design = ~treatment)
+    dds$treatment <- relevel(dds$treatment, ref = "control")
+  }else{
+    dds <- DESeqDataSetFromMatrix(countData = cts,
+                                  colData = coldata,
+                                  design = ~genotype)
+  }
+  
+  # Pre-filtering the dataset
+  nrow(dds)
+  keep <- rowSums(counts(dds)) > 1
+  dds <- dds[keep,]
+  nrow(dds)
+  # Filter for the subset of interest, 5 days of diff. and WT
+  dim(dds)
+  
+  if(COMPARISON == "treatment"){
+    dds <- dds[,dds$days_of_hoxb8_differentiation == 5 & dds$genotype == GENOTYPE]
+  }
+  if(COMPARISON == "JUNB"){
+    dds <- dds[,dds$days_of_hoxb8_differentiation == 5 & dds$genotype %in% c("WT", "JUNB") & dds$treatment == condition]
+    dds$genotype <- factor(dds$genotype, levels = c("WT", "JUNB"))
+  }
+  if(COMPARISON == "CEBPB"){
+    dds <- dds[,dds$days_of_hoxb8_differentiation == 5 & dds$genotype %in% c("WT", "CEBPB") & dds$treatment == condition]
+    dds$genotype <- factor(dds$genotype, levels = c("WT", "CEBPB"))
+  }
+  dds <- DESeq(dds)
+  
+  res <- lfcShrink(dds, coef = resultsNames(dds)[2], type = "apeglm")
+  return(list(dds, res))
+}
+
+```
+
+Perform DE analysis for WT, Zymosan 2h versus control
+
+```{r}
+# WT Zymosan vs. control
+res_WT <- get_res("WT", "treatment")[[2]]
+
+# KO Zymosan vs. resting KO
+res_JUNB_zymosan <- get_res("JUNB", "treatment")[[2]]
+res_CEBPB_zymosan <- get_res("CEBPB", "treatment")[[2]]
+
+# Resting TF-KO vs. control
+res_JUNB <- get_res("WT", "JUNB", condition="control")[[2]]
+res_CEBPB <- get_res("WT", "CEBPB", condition = "control")[[2]]
+
+# Activated TF-KO vs. activated control
+res_JUNB_activated <- get_res("WT", "JUNB", condition = "zymosan")[[2]]
+res_CEBPB_activated <- get_res("WT", "CEBPB", condition = "zymosan")[[2]]
+```
+
+Initialize function for overrepresentation analysis, this statistic can then be added to the respective figure.
+
+```{r}
+get_goseq <- function(res, direction, input){
+  
+  fdr.threshold <- 0.05
+  assayed.genes <- rownames(res)
+  if(direction == "up"){
+    de.genes <- rownames(res)[which(res$padj <= fdr.threshold & res$log2FoldChange >= 1)]
+  }else{
+    de.genes <- rownames(res)[which(res$padj <= fdr.threshold & res$log2FoldChange <= -1)]
+  }
+  gene.vector=as.integer(assayed.genes%in%de.genes)
+  names(gene.vector)=assayed.genes
+  
+  pwf <- nullp(gene.vector, "mm10", "geneSymbol")
+  
+  # cats <- rbind(data.frame(external_gene_name = up_genes, cat = "up"), data.frame(external_gene_name = dn_genes, cat = "dn"))
+  
+  cats <- rbind(data.frame(external_gene_name = input, cat = "up"))
+  
+  # cats %<>%
+  #   left_join(ortho_human_to_mouse[,c("external_gene_name", "mmusculus_homolog_associated_gene_name")], by = "external_gene_name")
+  
+  up_mouse <- cats[cats$cat == "up", "external_gene_name"]
+  # dn_mouse <-  cats[cats$cat == "dn", "mmusculus_homolog_associated_gene_name"]
+  
+  core_cats <- data.frame(gene = assayed.genes, cat = NA)
+  # core_cats$cat <- ifelse(core_cats$gene %in% up_mouse, "core_up", ifelse(core_cats$gene %in% dn_mouse, "core_dn", NA))
+  core_cats$cat <- ifelse(core_cats$gene %in% input, "core_up", NA)
+  
+  goseq.results <- goseq(pwf, genome = "mm10", gene2cat = core_cats, use_genes_without_cat = TRUE)
+  goseq.results$hitsPerc <- goseq.results$numDEInCat*100/goseq.results$numInCat
+  return(goseq.results)
+}
+
+
+goseq_WT_up <- get_goseq(res_WT, direction = "up", input = up_fisher_mouse)
+goseq_JUNB_up <- get_goseq(res_JUNB, direction = "up", input = up_fisher_mouse)
+goseq_JUNB_dn <- get_goseq(res_JUNB, direction = "dn", input = up_fisher_mouse)
+goseq_CEBPB_up <- get_goseq(res_CEBPB, direction = "up", input = up_fisher_mouse)
+goseq_CEBPB_dn <- get_goseq(res_CEBPB, direction = "dn", input = up_fisher_mouse)
+goseq_JUNB_activated_dn <- get_goseq(res_JUNB_activated, direction = "dn", input = up_fisher_mouse)
+goseq_CEBPB_activated_dn <- get_goseq(res_CEBPB_activated, direction = "dn", input = up_fisher_mouse)
+```
+Compare results with repeated random subsets.
+
+```{r}
+repeat_goseq <- function(res){
+  collect.res <- data.frame()
+  for(i in 1:1000){
+    print(i)
+  input <- rownames(res)[sample(nrow(res), length(up_fisher_mouse))]
+  go.res <- get_goseq(res, "up", input)
+  collect.res <- rbind(collect.res, go.res)
+  # current.p <- go_res$over_represented_pvalue
+  # collect.p <- append(collect.p, current.p)
+  }
+  return(collect.res)
+}
+
+res_WT_p <- repeat_goseq(res_WT)
+res_JUNB_p <- repeat_goseq(res_JUNB)
+res_CEBPB_p <- repeat_goseq(res_CEBPB)
+res_JUNB_activated_p <- repeat_goseq(res_JUNB_activated)
+res_CEBPB_activated_p <- repeat_goseq(res_CEBPB_activated)
+
+save(res_WT_p, 
+     res_JUNB_p,
+     res_CEBPB_p,
+     res_JUNB_activated_p,
+     res_CEBPB_activated_p,
+     file = "data/processed/data_1_fig_5d.rda")
+
+```
+
+Create DFs for LFC heatmaps and scatter plots.
+
+```{r}
+dds_to_df <- function(dds, current.comparison) {
+  dds %>% 
+    data.frame() %>%
+    dplyr::rename_with(~current.comparison, log2FoldChange) %>%
+    dplyr::select(-baseMean, -lfcSE, -pvalue) %>%
+    rownames_to_column("symbol")
+}
+res_WT_df <- dds_to_df(res_WT, "Zymosan_vs_control")
+res_JUNB_zymosan_df <- dds_to_df(res_JUNB_zymosan, "JUNBzymosan_vs_JUNBresting")
+res_JUNB_df <- dds_to_df(res_JUNB, "JUNB_vs_control")
+res_CEBPB_zymosan_df <- dds_to_df(res_CEBPB_zymosan, "CEBPBzymosan_vs_JUNBresting")
+res_CEBPB_df <- dds_to_df(res_CEBPB, "CEBPB_vs_control")
+res_JUNB_activated_df <- dds_to_df(res_JUNB_activated, "JUNBzymosan_vs_CONTROLzymosan")
+res_CEBPB_activated_df <- dds_to_df(res_CEBPB_activated, "CEBPBzymosan_vs_CONTROLzymosan")
+
+save(res_WT_df,
+     res_JUNB_zymosan_df,
+     res_JUNB_df,
+     res_CEBPB_df,
+     res_CEBPB_zymosan_df,
+     res_JUNB_activated_df,
+     res_CEBPB_activated_df,
+     file = "data/processed/data_1_fig_5e.rda")
+
+# LFC heatmap
+df <- data.frame(symbol = up_fisher_mouse) %>%
+  left_join(res_WT_df) %>%
+  left_join(res_JUNB_df) %>%
+  left_join(res_CEBPB_df) %>%
+  left_join(res_JUNB_activated_df) %>%
+  left_join(res_CEBPB_activated_df) %>%
+  column_to_rownames("symbol") %>%
+  arrange(desc(Zymosan_vs_control)) %>%
+  as.matrix()
+
+# LFC heatmap
+ComplexHeatmap::Heatmap(df,
+                        na_col = "grey",
+                        cluster_columns = T,
+                        cluster_rows = F,
+                        show_row_names = F)
+
+```
+
+
+Export DESeq2 results as well as goseq results for volcano plots.
+
+```{r}
+save(res_WT, res_JUNB, res_CEBPB, res_JUNB_activated, res_CEBPB_activated, goseq_WT_up, goseq_JUNB_dn, goseq_CEBPB_dn, goseq_JUNB_activated_dn, goseq_CEBPB_activated_dn, file = "data/processed/data_fig_5cd.rda")
+```
+
+
+
+Heatmap of core inflammation signature genes.
+
+```{r}
+dds <- get_res("WT", "treatment")[[1]]
+saveRDS(dds, file = "data/processed/data_fig_5e.rds")
+
+build_fig_5e()
+```
+

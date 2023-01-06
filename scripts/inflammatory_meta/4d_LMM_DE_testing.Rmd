@@ -1,0 +1,286 @@
+---
+title: "Inflammatory DE testing using a linear mixed model"
+author: "NSH"
+output: html_notebook
+---
+
+```{r setup}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r, message=FALSE}
+if (!require(lme4)) install.packages("lme4")
+
+if (!require(BiocManager)) install.packages("BiocManager")
+if (!require(survcomp)) BiocManager::install("survcomp")
+
+source("scripts/utils/utils.R")
+source("scripts/utils/figure_builder.R")
+```
+
+# Inflammatory DE testing
+
+## Sample selection
+
+Load the data and retrieve the relevant subset.
+
+```{r}
+cross_se <- readRDS("data/processed/cross_se.rds")
+cross_se_inflammatory <- cross_se[, cross_se$inflammatory_analysis]
+```
+
+
+```{r}
+cross_tpm <- assay(cross_se_inflammatory, "abundance") %>%
+  as.matrix()
+
+cross_meta <- colData(cross_se_inflammatory) %>%
+  as.data.frame()
+
+cross_meta %>%
+  group_by(study_id) %>%
+  summarise(n_healthy = sum(condition == "HC"),
+            n_inflamed = sum(condition != "HC"))
+```
+
+
+## Define a helper function
+
+Run a likelihood ratio test between full and null model for each gene.
+
+```{r}
+# TODO: implement updated tidyverse approach
+
+mixedMod <- function (counts, qc, x, cov.rand, cov.fix) {
+  
+  covRandom <- paste(paste("(1|qc$",cov.rand,")",sep=""),collapse=" + ")
+  
+  if(any(is.na(cov.fix))){
+    covs <- paste(" ", covRandom, sep="")
+  }else{
+    covFixed <- paste(paste("qc$", cov.fix, sep=""), collapse=" + ")
+    covs <- paste(covFixed, covRandom, sep=" + ")
+  }
+  
+  res <- apply(counts,1,function(y){
+    form1 <- as.formula(paste("y ~ x +", covs))
+    lm1 <- lmer(form1, REML=FALSE)
+    
+    form0 <- as.formula(paste("y ~", covs))
+    lm0 <- lmer(form0, REML=FALSE)
+    
+    # lhr using anova
+    anv <- anova(lm0, lm1)
+    #output beta, other stats
+    c(summary(lm1)$coefficients[2,], anv$Chisq[2], anv$P[2])
+    
+  })           
+  
+  res <- t(res)
+  colnames(res) <- c("Beta", "StdErr", "Tvalue", "Chisq", "Pvalue")
+  rownames(res) <- rownames(counts)
+  
+  res
+  
+}
+```
+
+
+## Model 1
+### Prepare data
+
+```{r}
+# meta
+qc <- cross_meta %>%
+  dplyr::select(study_id)
+cov.random <- c("study_id")
+x <- ifelse(cross_meta$condition == "HC", "HC", "INFL")
+
+# count data
+log2tpm <- log2(cross_tpm + 1)
+
+# filter counts
+min_samples <- cross_meta %>%
+  mutate(condition = ifelse(condition == "HC", "HC", "INFL")) %>%
+  group_by(condition) %>%
+  summarise(n_samples = n()) %>%
+  pull(n_samples) %>%
+  min()
+
+keep_samples <- rowSums(log2tpm >= 1) >= min_samples
+
+log2tpm_filtered <- log2tpm[keep_samples, ]
+```
+
+### Run the model
+
+```{r}
+model_res <- mixedMod(log2tpm_filtered, qc, x, cov.random, NA)
+```
+
+### Postprocessing
+
+```{r}
+model_res_df <- model_res %>%
+  as.data.frame() %>%
+  rownames_to_column("symbol") %>%
+  mutate(adj_Pvalue = p.adjust(Pvalue, method = "BH"),
+         label = ifelse(-log10(adj_Pvalue)*abs(Beta) >=
+                          sort(-log10(adj_Pvalue)*abs(Beta), decreasing = T)[20], symbol, ""),
+         color = ifelse(adj_Pvalue <= 0.05,
+                        ifelse(abs(Beta) >= 1, "both", "p"),
+                        ifelse(abs(Beta) >= 1, "lfc", "none")))
+
+model_res_df %>%
+  mutate(group = ifelse(adj_Pvalue <= 0.05,
+                        ifelse(Beta >= 1, "up",
+                               ifelse(Beta <= -1, "dn", "only p")),
+                        ifelse(abs(Beta) >= 1, "only lfc", "none"))) %>%
+  group_by(group) %>%
+  summarise(count = n())
+```
+
+```{r}
+fisher_up_genes <- readRDS("data/processed/fisher_up_genes.rds")
+fisher_dn_genes <- readRDS("data/processed/fisher_dn_genes.rds")
+fisher_p_lfc_df <- readRDS("data/processed/fisher_p_lfc_df.rds")
+
+lmm_up_genes <- model_res_df %>%
+  mutate(group = ifelse(adj_Pvalue <= 0.05,
+                        ifelse(Beta >= 1, "up",
+                               ifelse(Beta <= -1, "dn", "only p")),
+                        ifelse(abs(Beta) >= 1, "only lfc", "none"))) %>%
+  filter(group == "up") %>%
+  pull(symbol)
+
+lmm_dn_genes <- model_res_df %>%
+  mutate(group = ifelse(adj_Pvalue <= 0.05,
+                        ifelse(Beta >= 1, "up",
+                               ifelse(Beta <= -1, "dn", "only p")),
+                        ifelse(abs(Beta) >= 1, "only lfc", "none"))) %>%
+  filter(group == "dn") %>%
+  pull(symbol)
+
+length(intersect(lmm_up_genes, fisher_up_genes))
+length(intersect(lmm_dn_genes, fisher_dn_genes))
+
+length(intersect(lmm_up_genes, fisher_dn_genes))
+length(intersect(lmm_dn_genes, fisher_up_genes))
+intersect(lmm_dn_genes, fisher_up_genes)
+
+length(c(lmm_up_genes, lmm_dn_genes))
+length(intersect(c(lmm_up_genes, lmm_dn_genes), fisher_p_lfc_df$symbol))
+```
+
+
+
+```{r}
+ggplot(model_res_df, aes(x = Pvalue)) +
+  geom_histogram()
+ggplot(model_res_df, aes(x = adj_Pvalue)) +
+  geom_histogram()
+ggplot(model_res_df, aes(x = Beta, y = -log10(adj_Pvalue), color = color)) +
+  geom_point() +
+  geom_text_repel(aes(label = label, color = NULL),
+                  box.padding = 0.5,
+                  show.legend = F) +
+  scale_color_manual(name = "Group",
+                     breaks = c("both", "lfc", "p", "none"),
+                     labels = c("Both", "Only LFC", "Only P", "NS"),
+                     values = c("red", "darkgreen", "blue", "black"))
+```
+
+<!-- MODEL2 not relevant for manuscript; interesting to show concordance between models -->
+
+## Model 2
+### Prepare data
+
+```{r}
+# meta
+qc <- cross_meta %>%
+  dplyr::select(study_id, origin_tissue, species)
+cov.random <- c("study_id")
+cov.fixed <- c("species")
+x <- ifelse(cross_meta$condition == "HC", "HC", "INFL")
+
+# count data
+log2tpm <- log2(cross_tpm + 1)
+
+# filter counts
+min_samples <- cross_meta %>%
+  mutate(condition = ifelse(condition == "HC", "HC", "INFL")) %>%
+  group_by(condition) %>%
+  summarise(n_samples = n()) %>%
+  pull(n_samples) %>%
+  min()
+
+keep_samples <- rowSums(log2tpm >= 1) >= min_samples
+
+log2tpm_filtered <- log2tpm[keep_samples, ]
+```
+
+### Run the model
+
+```{r}
+model_res_2 <- mixedMod(log2tpm_filtered, qc, x, cov.random, cov.fixed)
+```
+
+### Postprocessing
+
+```{r}
+model_res_df_2 <- model_res_2 %>%
+  as.data.frame() %>%
+  rownames_to_column("symbol") %>%
+  mutate(adj_Pvalue = p.adjust(Pvalue, method = "BH"),
+         label = ifelse(-log10(adj_Pvalue)*abs(Beta) >=
+                          sort(-log10(adj_Pvalue)*abs(Beta), decreasing = T)[20], symbol, ""),
+         color = ifelse(adj_Pvalue <= 0.05,
+                        ifelse(abs(Beta) >= 1, "both", "p"),
+                        ifelse(abs(Beta) >= 1, "lfc", "none")))
+
+model_res_df_2 %>%
+  mutate(group = ifelse(adj_Pvalue <= 0.05,
+                        ifelse(Beta >= 1, "up",
+                               ifelse(Beta <= -1, "dn", "only p")),
+                        ifelse(abs(Beta) >= 1, "only lfc", "none"))) %>%
+  group_by(group) %>%
+  summarise(count = n())
+```
+
+
+```{r}
+ggplot(model_res_df_2, aes(x = Pvalue)) +
+  geom_histogram()
+ggplot(model_res_df_2, aes(x = adj_Pvalue)) +
+  geom_histogram()
+ggplot(model_res_df_2, aes(x = Beta, y = -log10(adj_Pvalue), color = color)) +
+  geom_point() +
+  geom_text_repel(aes(label = label, color = NULL),
+                  box.padding = 0.5,
+                  show.legend = F) +
+  scale_color_manual(name = "Group",
+                     breaks = c("both", "lfc", "p", "none"),
+                     labels = c("Both", "Only LFC", "Only P", "NS"),
+                     values = c("red", "darkgreen", "blue", "black"))
+```
+
+```{r}
+integrated_model_res <- model_res_df %>%
+  transmute(symbol,
+            adj_Pvalue_1 = adj_Pvalue,
+            Beta_1 = Beta) %>%
+  inner_join(model_res_df_2 %>%
+               transmute(symbol,
+                         adj_Pvalue_2 = adj_Pvalue,
+                         Beta_2 = Beta), by = "symbol")
+
+ggplot(integrated_model_res, aes(x = adj_Pvalue_1, y = adj_Pvalue_2)) +
+  geom_point()
+ggplot(integrated_model_res, aes(x = Beta_1, y = Beta_2)) +
+  geom_point()
+```
+
+```{r}
+save(model_res, model_res_df, model_res_2, model_res_df_2, file = "data/processed/LMM_res_composite.rda")
+```
+

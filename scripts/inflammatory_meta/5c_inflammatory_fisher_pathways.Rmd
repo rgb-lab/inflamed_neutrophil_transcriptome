@@ -1,0 +1,188 @@
+---
+title: "Pathway enrichment for inflammatory fisher signature"
+author: "NSH"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r, message=FALSE, include=FALSE}
+if (!require(tidyverse)) install.packages("tidyverse")
+if (!require(magrittr)) install.packages("magrittr")
+if (!require(msigdbr)) install.packages("msigdbr")
+if (!require(viridis)) install.packages("viridis")
+
+if (!require(BiocManager)) install.packages("BiocManager")
+if (!require(fgsea)) BiocManager::install("fgsea")
+if (!require(ComplexHeatmap)) BiocManager::install("ComplexHeatmap")
+
+source("scripts/utils/figure_builder.R")
+```
+
+```{r include=FALSE}
+res_list <- readRDS("data/processed/de_seq_res_list.rds")
+```
+
+# Retrieve data for GSEA
+
+For GSEA, we are using hallmark gene sets.
+
+```{r}
+prepare_gene_sets <- function (species = "Homo sapiens", category = "H", subcategory = NULL) {
+  
+  gene_sets <- msigdbr(species = species, category = category, subcategory = subcategory)
+  set_names <- as.list(unique(gene_sets[["gs_name"]]))
+  names(set_names) <- set_names
+  
+  set_list <- lapply (set_names, function (name, gene_sets) {
+    gene_sets[gene_sets[["gs_name"]] == name, ][["human_gene_symbol"]]
+  }, gene_sets)
+  
+}
+
+# retrieve the hallmark sets and format them according to the fgsea requirements
+h_set_list <- prepare_gene_sets()
+```
+
+# GSEA
+
+Perform GSEA based on hallmark genesets and rankings based on lfc values.
+
+```{r}
+ranked_lists <- lapply (res_list, function (res) {
+  
+  ranked_list <- res %>%
+    as.data.frame() %>%
+    rownames_to_column("symbol") %>%
+    filter(!is.na(padj)) %>%
+    arrange(desc(log2FoldChange)) %>%
+    pull(log2FoldChange, symbol)
+  
+})
+
+fgsea_res <- lapply (ranked_lists, function (ranked_list) {
+
+  set.seed(42)
+  fgsea(stats = ranked_list,
+        pathways = h_set_list)
+  
+})
+
+fgsea_res_dfs <- lapply (names(fgsea_res), function (cur_name) {
+
+  fgsea_res[[cur_name]] %>%
+    as.data.frame() %>%
+    dplyr::select(pathway, NES, padj) %>%
+    mutate(query = cur_name)
+  
+})
+
+fgsea_res_df_all <- Reduce(rbind, fgsea_res_dfs)
+
+fgsea_res_df_man <- fgsea_res_df_all %>%
+  as.data.frame() %>%
+  mutate(sig_NES = ifelse(padj <= 0.05, NES, NA)) %>%
+  group_by(pathway) %>%
+  mutate(frac_non_sig_enrichment = sum(is.na(sig_NES))/length(sig_NES)) %>%
+  ungroup()
+```
+
+# NES Heatmap
+
+```{r}
+plt_nes_hm <- fgsea_res_df_man %>%
+  filter(frac_non_sig_enrichment <= 0.5) %>%
+  pivot_wider(id_cols = c("pathway"),
+              names_from = "query",
+              values_from = "NES") %>%
+  column_to_rownames("pathway")
+
+rownames(plt_nes_hm) <- rownames(plt_nes_hm) %>%
+  str_remove("^HALLMARK_") %>%
+  str_replace_all("_", " ")
+
+colnames(plt_nes_hm) <- colnames(plt_nes_hm) %>%
+  str_remove("condition") %>%
+  str_remove("vs_HC") %>%
+  str_replace_all("_", " ")
+
+saveRDS(plt_nes_hm, "data/processed/data_fig_4e_1.rds")
+```
+
+
+# p value Heatmap
+
+```{r fig.height=4, fig.width=7}
+plt_p_hm <- fgsea_res_df_man %>%
+  filter(frac_non_sig_enrichment <= 0.5) %>%
+  mutate(log_p = -log10(padj)) %>%
+  pivot_wider(id_cols = c("pathway"),
+              names_from = "query",
+              values_from = "log_p") %>%
+  column_to_rownames("pathway")
+
+rownames(plt_p_hm) <- rownames(plt_p_hm) %>%
+  str_remove("^HALLMARK_") %>%
+  str_replace_all("_", " ")
+
+colnames(plt_p_hm) <- colnames(plt_p_hm) %>%
+  str_remove("condition") %>%
+  str_remove("vs_HC") %>%
+  str_replace_all("_", " ")
+
+col_annotation <- data.frame(names = colnames(plt_p_hm)) %>%
+  mutate(species = str_remove(colnames(plt_p_hm), "^.* ")) %>%
+  column_to_rownames("names")
+
+plt_p_hm <- plt_p_hm[, match(colnames(plt_p_hm), rownames(col_annotation))]
+
+col_fun <- colorRamp2(seq(0, max(plt_p_hm), (max(plt_p_hm))/24), plasma(25))
+
+ComplexHeatmap::pheatmap(plt_p_hm,
+                         cellwidth = 20,
+                         cellheight = 20,
+                         border_color = NA,
+                         name = "-log10(padj)",
+                         show_colnames = T,
+                         show_rownames = T,
+                         cluster_rows = F,
+                         cluster_cols = F,
+                         annotation_col = col_annotation,
+                         annotation_colors = list(species = species_pal),
+                         annotation_legend = T,
+                         color = col_fun)
+```
+
+# Masked NES Heatmap
+
+```{r}
+plt_sig_nes_hm <- fgsea_res_df_man %>%
+  filter(frac_non_sig_enrichment <= 0.5) %>%
+  pivot_wider(id_cols = c("pathway"),
+              names_from = "query",
+              values_from = "sig_NES") %>%
+  column_to_rownames("pathway")
+
+rownames(plt_sig_nes_hm) <- rownames(plt_sig_nes_hm) %>%
+  str_remove("^HALLMARK_") %>%
+  str_replace_all("_", " ")
+
+colnames(plt_sig_nes_hm) <- colnames(plt_sig_nes_hm) %>%
+  str_remove("condition") %>%
+  str_remove("vs_HC") %>%
+  str_replace_all("_", " ")
+
+
+saveRDS(plt_sig_nes_hm, "data/processed/data_fig_4e_2.rds")
+```
+
+
+```{r fig.height=4, fig.width=7}
+fig_3e_1 <- build_fig_3e_1()
+fig_3e_2 <- build_fig_3e_2()
+
+fig_3e_1
+fig_3e_2
+```

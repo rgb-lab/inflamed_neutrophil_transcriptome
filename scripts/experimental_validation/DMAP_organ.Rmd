@@ -1,0 +1,123 @@
+---
+title: "organ_validation"
+author: "TE"
+date: "19 5 2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+if (!require(ggplot2)) install.packages("ggplot2")
+if(!require(ggrastr)) install.packages("ggrastr")
+if(!require(viridis)) install.packages("viridis")
+if (!require(BiocManager)) install.packages("BiocManager")
+if (!require(CATALYST)) BiocManager::install("CATALYST")
+
+source("scripts/utils/figure_builder.R")
+```
+
+# Read data
+
+```{r}
+
+# bm_data <- readRDS("BM/002_FACS_dataset_4xDR_60000_cells.rds")
+# pb_data <- readRDS("PB/002_FACS_dataset_4xDR_60000_cells.rds")
+# spl_data <- readRDS("SPL/002_FACS_dataset_4xDR_60000_cells.rds")
+
+bm_data <- readRDS("data/raw_data/experiments/BM/002_FACS_dataset_4xDR_60000_cells.rds")
+pb_data <- readRDS("data/raw_data/experiments/PB/002_FACS_dataset_4xDR_60000_cells.rds")
+spl_data <- readRDS("data/raw_data/experiments/SPL/002_FACS_dataset_4xDR_60000_cells.rds")
+antigens <- rowData(bm_data)$marker_name
+excluded_antigens <- c("Ly6G", "LD")
+
+```
+
+
+```{r}
+
+
+'%!in%' <- function(x,y)!('%in%'(x,y))
+dr = "DiffusionMap"
+
+bm_df <- plotDR(bm_data, dr = dr, color_by = "condition")$data
+set.seed(42)
+bm_df <- bm_df[sample(nrow(bm_df), nrow(bm_df), replace = FALSE) , ]
+
+pb_df <- plotDR(pb_data, dr = dr, color_by = "condition")$data
+set.seed(42)
+pb_df <- pb_df[sample(nrow(pb_df), nrow(pb_df), replace = FALSE) , ]
+
+spl_df <- plotDR(spl_data, dr = dr, color_by = "condition")$data
+set.seed(42)
+spl_df <- spl_df[sample(nrow(spl_df), nrow(spl_df), replace = FALSE) , ]
+
+bm_df$x <- -bm_df$x
+bm_df$y <- -bm_df$y
+
+bm_df[c("x", "y")] <- apply(bm_df[c("x", "y")], MARGIN = 2, FUN = function(x)(x-min(x))/diff(range(x)))
+pb_df[c("x", "y")] <- apply(pb_df[c("x", "y")], MARGIN = 2, FUN = function(x)(x-min(x))/diff(range(x)))
+spl_df[c("x", "y")] <- apply(spl_df[c("x", "y")], MARGIN = 2, FUN = function(x)(x-min(x))/diff(range(x)))
+
+
+saveRDS(bm_df, "data/processed/data_fig_7b_bm.rds")
+saveRDS(pb_df, "data/processed/data_fig_7b_pb.rds")
+saveRDS(spl_df, "data/processed/data_fig_7b_spl.rds")
+
+
+bm_markers <- plotDR(bm_data, dr = dr, color_by = antigens)$data %>%
+                         dplyr::filter(variable %!in% c("Ly6G", "LD"))
+
+
+pb_markers <- plotDR(pb_data, dr = dr, color_by = antigens)$data %>%
+                         dplyr::filter(variable %!in% c("Ly6G", "LD"))
+
+spl_markers <- plotDR(spl_data, dr = dr, color_by = antigens)$data %>%
+                          dplyr::filter(variable %!in% c("Ly6G", "LD"))
+
+
+bm_markers$x <- -bm_markers$x
+bm_markers$y <- -bm_markers$y
+
+pb_markers$x <- pb_markers$x
+pb_markers$y <- pb_markers$y
+
+spl_markers$x <- spl_markers$x
+spl_markers$y <- spl_markers$y
+
+bm_markers[c("x", "y")] <- apply(bm_markers[c("x", "y")], MARGIN = 2, FUN = function(x)(x-min(x))/diff(range(x)))
+pb_markers[c("x", "y")] <- apply(pb_markers[c("x", "y")], MARGIN = 2, FUN = function(x)(x-min(x))/diff(range(x)))
+spl_markers[c("x", "y")] <- apply(spl_markers[c("x", "y")], MARGIN = 2, FUN = function(x)(x-min(x))/diff(range(x)))
+
+
+saveRDS(bm_markers, "data/processed/data_fig_7c_bm.rds")
+saveRDS(pb_markers, "data/processed/data_fig_7c_pb.rds")
+saveRDS(spl_markers, "data/processed/data_fig_7c_spl.rds")
+
+```
+# Data from human and mice
+
+
+```{r}
+
+fig7b <- build_fig_7b()
+fig7c <- build_fig_7c()
+```
+
+```{r}
+#pdf("human_conditions_UMAP.pdf",
+#    width = 9*0.75,
+#    height = 7*0.75)
+build_fig_7b()
+#dev.off()
+```
+
+```{r}
+# pdf("human_markers_UMAP.pdf",
+#     width = 9*0.75,
+#     height = 7*0.75)
+fig7c
+# dev.off()
+```

@@ -1,0 +1,83 @@
+---
+title: "FACS UMAP"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r}
+if (!require(ggplot2)) install.packages("ggplot2")
+if(!require(ggrastr)) install.packages("ggrastr")
+if(!require(viridis)) install.packages("viridis")
+if(!require(magrittr)) install.packages("magrittr")
+if(!require(dplyr)) install.packages("dplyr")
+if (!require(BiocManager)) install.packages("BiocManager")
+if (!require(CATALYST)) BiocManager::install("CATALYST")
+
+source("scripts/utils/figure_builder.R")
+```
+
+# Read data
+
+```{r}
+
+sce <- readRDS("data/raw_data/experiments/002_FACS_dataset_4xDR_60000_cells.rds")
+antigens <- rowData(sce)$marker_name
+
+```
+
+# Data from human and mice
+
+```{r}
+df_conditions <- plotDR(sce,
+                        dr = "DiffusionMap",
+                        color_by = c("condition"))$data
+
+set.seed(42)
+df_conditions <- df_conditions %>%
+  group_by(group) %>%
+  do(sample_n(.,nrow(df_conditions[df_conditions == "mouse",]))) %>%
+  ungroup() %>%
+  do(sample_n(., 2*nrow(df_conditions[df_conditions == "mouse",]))) %>%
+  as.data.frame()
+
+
+df_markers <- plotDR(sce,
+                     dr = "DiffusionMap",
+                     color_by = antigens[antigens %in% c("PDL1",
+                                                         "CD40",
+                                                         "IL4R",
+                                                         "CD69",
+                                                         "CD14")])$data
+
+
+saveRDS(df_conditions, "data/processed/data_fig_6d.rds")
+saveRDS(df_markers, "data/processed/data_fig_6e.rds")
+
+
+```
+
+```{r}
+# p_conditions <- build_fig_6c()
+# p_markers <- build_fig_6d()
+```
+
+```{r}
+#pdf("human_conditions_UMAP.pdf",
+#    width = 9*0.75,
+#    height = 7*0.75)
+# grid.draw(p_conditions)
+#dev.off()
+```
+
+```{r}
+# pdf("human_markers_UMAP.pdf",
+#     width = 9*0.75,
+#     height = 7*0.75)
+# p_markers
+# dev.off()
+```
+

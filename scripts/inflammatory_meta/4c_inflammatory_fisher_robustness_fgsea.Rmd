@@ -1,0 +1,216 @@
+---
+title: "Inflammatory Fisher robustness: fGSEA"
+author: "NSH"
+output: html_notebook
+---
+
+```{r setup}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r, message=FALSE}
+if (!require(tidyverse)) install.packages("tidyverse")
+if (!require(magrittr)) install.packages("magrittr")
+
+if (!require(BiocManager)) install.packages("BiocManager")
+if (!require(fgsea)) BiocManager::install("fgsea")
+if (!require(ComplexHeatmap)) BiocManager::install("ComplexHeatmap")
+
+source("scripts/utils/config.R")
+```
+
+```{r}
+res_list <- readRDS("data/processed/de_seq_res_list.rds")
+up_genes <- readRDS("data/processed/fisher_up_genes.rds")
+dn_genes <- readRDS("data/processed/fisher_dn_genes.rds")
+```
+
+Here, we use a custom fGSEA to calculate enrichment of each study's top differentially expressed genes (by pval) within the ranked list of each other study (by lfc).
+
+# Prepare data
+
+```{r}
+# set n for the analysis, maximum 250!
+global_n <- 250
+
+gene_sets_up <- lapply (res_list, function (res) {
+  
+  genes <- res %>%
+    as.data.frame() %>%
+    rownames_to_column("symbol") %>%
+    filter(log2FoldChange > 0.5, padj < 0.05) %>%
+    slice_min(order_by = padj, n = global_n, with_ties = F) %>%
+    dplyr::select(symbol, padj) %>%
+    pull(symbol)
+  
+  return (genes)
+})
+gene_sets_up[["fisher"]] <- up_genes[1:global_n]
+
+gene_sets_dn <- lapply (res_list, function (res) {
+  
+  genes <- res %>%
+    as.data.frame() %>%
+    rownames_to_column("symbol") %>%
+    filter(log2FoldChange < -0.5, padj < 0.05) %>%
+    slice_min(order_by = padj, n = global_n, with_ties = F) %>%
+    dplyr::select(symbol, padj) %>%
+    pull(symbol)
+  
+  return (genes)
+})
+gene_sets_dn[["fisher"]] <- dn_genes[1:global_n]
+
+
+study_stats <- lapply (res_list, function (res) {
+  
+  stat_df <- res %>%
+    as.data.frame() %>%
+    mutate(score = log2FoldChange) %>%
+    dplyr::arrange(desc(score))
+  
+  stat <- pull(stat_df, score)
+  names(stat) <- rownames(stat_df)
+  
+  return (stat)
+})
+
+names(gene_sets_dn) <- paste0("Dn__", names(gene_sets_dn))
+names(gene_sets_up) <- paste0("Up__", names(gene_sets_up))
+gene_sets <- append(gene_sets_dn, gene_sets_up)
+```
+
+# Run fGSEA
+
+```{r}
+fgsea_res <- lapply (study_stats, function (stat) {
+  
+  res <- fgsea(pathways = gene_sets,
+               stats = stat,
+               nPermSimple = 1000000)
+  
+  return (res)
+  
+})
+```
+
+# Postprocess results
+
+```{r}
+nes_list <- lapply (seq_along(fgsea_res), function (i, fgsea_res) {
+  
+  res <- fgsea_res[[i]]
+  
+  df <- res %>%
+    dplyr::select(pathway, NES)
+  
+  colnames(df) <- c("pathway", paste0(names(fgsea_res)[[i]], "_NES"))
+  
+  return(df)
+  
+}, fgsea_res)
+
+nes_df <- Reduce(function (df1, df2) left_join(df1, df2, by = "pathway"), nes_list) %>%
+  column_to_rownames("pathway")
+
+nes_df_up <- nes_df[grepl("^Up__", rownames(nes_df)), ]
+nes_df_dn <- nes_df[grepl("^Dn__", rownames(nes_df)), ]
+
+nes_df_up <- nes_df_up[ , match(str_replace(rownames(nes_df_up), "^Up__", "")[1:(nrow(nes_df_up)-1)],
+                                         str_replace(colnames(nes_df_up), "_NES$", ""))]
+
+nes_df_dn <- nes_df_dn[ , match(str_replace(rownames(nes_df_dn), "^Dn__", "")[1:(nrow(nes_df_dn)-1)],
+                                         str_replace(colnames(nes_df_dn), "_NES$", ""))]
+```
+
+
+# Visualze results
+
+```{r}
+nes_df_up_scaled <- nes_df_up %>%
+  scale()
+
+nes_df_dn_scaled <- nes_df_dn %>%
+  scale()
+```
+
+```{r}
+colfun <- generate_rd_bu_colfun(-1.5, 1.5)
+row_anno <- rowAnnotation(all = anno_boxplot(nes_df_up_scaled))
+Heatmap(nes_df_up_scaled,
+        cluster_columns = F,
+        cluster_rows = F,
+        show_column_names = F,
+        show_row_names = T,
+        right_annotation = row_anno,
+        col = colfun)
+row_anno <- rowAnnotation(all = anno_boxplot(nes_df_dn_scaled))
+Heatmap(nes_df_dn_scaled,
+        cluster_columns = F,
+        cluster_rows = F,
+        show_column_names = F,
+        show_row_names = T,
+        right_annotation = row_anno,
+        col = colfun)
+```
+```{r}
+nes_df_up %>%
+  as.data.frame() %>%
+  rownames_to_column("gene_sets") %>%
+  pivot_longer(cols = -"gene_sets",
+               names_to = "study",
+               values_to = "NES") %>%
+  mutate(gene_sets = str_remove(gene_sets, "^Up__"),
+         study = str_remove(study, "_NES$")) %>%
+  #filter(gene_sets == study |
+  #         gene_sets == "fisher") %>%
+  ggplot(mapping = aes(x = gene_sets, y = NES)) +
+    geom_boxplot() +
+  coord_flip()
+
+nes_df_dn %>%
+  as.data.frame() %>%
+  rownames_to_column("gene_sets") %>%
+  pivot_longer(cols = -"gene_sets",
+               names_to = "study",
+               values_to = "NES") %>%
+  mutate(gene_sets = str_remove(gene_sets, "^Dn__"),
+         study = str_remove(study, "_NES$")) %>%
+  #filter(gene_sets == study |
+  #         gene_sets == "fisher") %>%
+  ggplot(mapping = aes(x = gene_sets, y = NES)) +
+    geom_boxplot() +
+  coord_flip()
+
+nes_df_up_scaled %>%
+  as.data.frame() %>%
+  rownames_to_column("gene_sets") %>%
+  pivot_longer(cols = -"gene_sets",
+               names_to = "study",
+               values_to = "NES") %>%
+  mutate(gene_sets = str_remove(gene_sets, "^Up__"),
+         study = str_remove(study, "_NES$")) %>%
+  #filter(gene_sets == study |
+  #         gene_sets == "fisher") %>%
+  ggplot(mapping = aes(x = gene_sets, y = NES)) +
+    geom_boxplot() +
+  coord_flip()
+
+nes_df_dn_scaled %>%
+  as.data.frame() %>%
+  rownames_to_column("gene_sets") %>%
+  pivot_longer(cols = -"gene_sets",
+               names_to = "study",
+               values_to = "NES") %>%
+  mutate(gene_sets = str_remove(gene_sets, "^Dn__"),
+         study = str_remove(study, "_NES$")) %>%
+  #filter(gene_sets == study |
+  #         gene_sets == "fisher") %>%
+  ggplot(mapping = aes(x = gene_sets, y = NES)) +
+    geom_boxplot() +
+  coord_flip()
+```
+
+```{r}
+saveRDS(nes_df, "data/processed/study_fisher_NES.rds")
+```

@@ -1,0 +1,411 @@
+---
+title: "WGCNA for inflammatory samples"
+author: "NSH"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r message=FALSE, include=FALSE}
+if (!require(tidyverse)) install.packages("tidyverse")
+if (!require(magrittr)) install.packages("magrittr")
+if (!require(ggplot2)) install.packages("ggplot2")
+if (!require(RColorBrewer)) install.packages("RColorBrewer")
+
+if (!require(BiocManager)) install.packages("BiocManager")
+if (!require(DESeq2)) BiocManager::install("DESeq2")
+if (!require(vsn)) BiocManager::install("vsn")
+if (!require(ComplexHeatmap)) BiocManager::install("ComplexHeatmap")
+if (!require(circlize)) BiocManager::install("circlize")
+if (!require(sva)) BiocManager::install("sva")
+if (!require(edgeR)) BiocManager::install("edgeR")
+if (!require(qvalue)) BiocManager::install("qvalue")
+if (!require(WGCNA)) BiocManager::install("WGCNA")
+if (!require(impute)) BiocManager::install("impute")
+# import color palettes
+source("scripts/utils/utils.R")
+source("scripts/utils/figure_builder.R")
+
+options(stringsAsFactors = FALSE)
+```
+
+```{r include=FALSE}
+cross_se <- readRDS("data/processed/cross_se.rds")
+cross_se_inflammatory <- cross_se[, cross_se$inflammatory_analysis]
+
+p_df <- readRDS("data/processed/fisher_p_df.rds")
+lfc_df <- readRDS("data/processed/fisher_lfc_df.rds")
+p_lfc_df <- readRDS("data/processed/fisher_p_lfc_df.rds")
+up_genes <- readRDS("data/processed/fisher_up_genes.rds")
+dn_genes <- readRDS("data/processed/fisher_dn_genes.rds")
+```
+
+
+```{r}
+series <- factor(colData(cross_se_inflammatory)[["series"]])
+expr <- as.matrix(assay(cross_se_inflammatory, "counts"))
+expr_corrected <- ComBat_seq(expr, series)
+
+expr_corrected_norm <- calcNormFactors(DGEList(expr_corrected), method = "TMM")
+lcpm <- edgeR::cpm(expr_corrected_norm, log = TRUE)
+```
+
+
+
+```{r}
+# commented out for performance reasons, power 6 seems to be most appropriate
+#
+# powers <- seq (1, 8)
+# 
+# sft <- pickSoftThreshold(t(lcpm), powerVector = powers)
+# # sft <- pickSoftThreshold(expr_corrected_norm$counts, powerVector = powers)
+# 
+# 
+# ggplot(sft$fitIndices, aes(x = Power, y = SFT.R.sq*-sign(slope), label = Power)) +
+#   geom_point() +
+#   geom_text_repel()
+# ggplot(sft$fitIndices, aes(x = Power, y = mean.k., label = Power)) +
+#   geom_point() +
+#   geom_text_repel()
+```
+
+```{r}
+# pow 6/8
+net <- blockwiseModules(t(lcpm),
+                        power = 6,
+                        TOMType = "signed",
+                        minModuleSize = 30,
+                        reassignThreshold = 0,
+                        mergeCutHeight = 0.25,
+                        numericLabels = T,
+                        pamRespectsDendro = F,
+                        verbose = 3)
+```
+
+```{r}
+table(net$colors)
+mergedColors <- labels2colors(net$colors)
+```
+
+
+```{r}
+# define the exclusion of modules with more than 1000 genes
+
+# see above table
+incl_modules <- table(net$colors) %>%
+  as.data.frame() %>%
+  filter(Freq <= 1000) %>%
+  mutate(MEs = paste0("ME", Var1)) %>%
+  pull(MEs)
+```
+
+
+```{r}
+mem <- t(net$MEs)[incl_modules, ]
+
+meta <- cross_se_inflammatory[, colnames(mem)] %>%
+  colData() %>%
+  as.data.frame()
+stopifnot(rownames(meta) == colnames(mem))
+
+order_df <- cross_se_inflammatory %>%
+  colData() %>%
+  as.data.frame() %>%
+  mutate(condition = ifelse(condition == "HC", "HC", "INFL")) %>%
+  arrange(condition, species) %>%
+  dplyr::transmute(sample = SRX_accession,
+                   condition,
+                   species)
+
+anno <- columnAnnotation(condition = order_df$condition,
+                         species = order_df$species)
+msc <- mem %>%
+  t() %>%
+  scale() %>%
+  t()
+# pow 8: c("ME26", "ME12", "ME19")
+Heatmap(mem[, order_df$sample, drop = F],
+        top_annotation = anno,
+        cluster_columns = F,
+        clustering_method_rows = "ward.D2")
+```
+
+```{r, fig.height=20, fig.width=20}
+memta <- mem %>%
+  as.data.frame() %>%
+  rownames_to_column("MEs") %>%
+  pivot_longer(cols = -MEs,
+               names_to = "sample",
+               values_to = "value") %>%
+  left_join(meta %>%
+              transmute(sample = SRX_accession,
+                        condition_all = condition,
+                        condition = ifelse(condition == "HC", "HC", "INFL"),
+                        species,
+                        series))
+
+ggplot (memta, aes (x = species, y = value, color = condition)) +
+  geom_boxplot() +
+  #geom_jitter() +
+  facet_wrap(~MEs)
+```
+
+# Check correlation of MEs with dichotomous condition
+
+```{r}
+memta %>%
+  mutate(condhot = ifelse(condition == "HC", 0, 1)) %>%
+  group_by(MEs) %>%
+  summarise(cor_cond = cor.test(value, condhot)$estimate,
+            cor_cond_p = cor.test(value, condhot)$p.value) %>%
+  arrange(desc(cor_cond))
+```
+
+# Check fraction of Module genes also in fisher gene sets
+
+```{r}
+tibble(gene = names(net$colors),
+       color = net$colors) %>%
+  group_by(color) %>%
+  summarise(frac_in_up = sum(gene %in% up_genes)/length(gene),
+            frac_in_dn = sum(gene %in% dn_genes)/length(gene)) %>%
+  arrange(desc(frac_in_up))
+```
+
+# FET
+
+```{r}
+# smooth grouped tidyverse version
+all_genes <- names(net$colors)
+fisher_core <- readRDS("data/processed/up_fisher_human.rds")
+module_stats <- tibble(
+  mod = sort(unique(net$colors)),
+  module_name = paste0("ME", mod)) %>%
+  group_by(mod) %>%
+  mutate(
+    genes = list(names(net$colors[net$colors == mod])),
+    setsize = length(genes[[1]]),
+    # comment in for debug info
+    # set_and_fisher = list(intersect(genes[[1]], fisher_core)),
+    # set_not_fisher = list(setdiff(genes[[1]], fisher_core)),
+    # not_set_and_fisher = list(setdiff(fisher_core, genes[[1]])),
+    # not_set_not_fisher = list(setdiff(all_genes, c(genes[[1]], fisher_core))),
+    len_set_and_fisher = length(intersect(genes[[1]], fisher_core)),
+    len_set_not_fisher = length(setdiff(genes[[1]], fisher_core)),
+    len_not_set_and_fisher = length(setdiff(fisher_core, genes[[1]])),
+    len_not_set_not_fisher = length(setdiff(all_genes, c(genes[[1]], fisher_core))),
+    frac_set_in_fisher = len_set_and_fisher/setsize,
+    fisher_p = fisher.test(
+      matrix(
+        c(
+          len_set_and_fisher, len_set_not_fisher,
+          len_not_set_and_fisher, len_not_set_not_fisher
+          ),
+        ncol = 2,
+        byrow = T),
+      alternative = "greater")$p.value
+    ) %>%
+  ungroup() %>%
+  mutate(padj = p.adjust(fisher_p, method = "BH")) %>%
+  arrange(padj)
+
+sig_modules <- module_stats %>%
+  filter(padj < 0.05) %>%
+  pull(module_name)
+```
+
+
+
+# Check correlation with each condition
+
+```{r}
+one_hot_conds <- model.matrix(~ 0 + condition + species, data = meta)
+
+stopifnot(all(rownames(t(mem)) == rownames(one_hot_conds)))
+
+cond_cors <- cor(t(mem), one_hot_conds)
+significances <- corPvalueStudent(cond_cors, nrow(one_hot_conds))
+
+stopifnot(all(rownames(cond_cors) == rownames(significances)))
+stopifnot(all(colnames(cond_cors) == colnames(significances)))
+
+masked_cond_cors <- cond_cors
+masked_cond_cors[significances < 0.05] <- NA
+
+Heatmap(cond_cors)
+Heatmap(masked_cond_cors)
+```
+
+
+```{r}
+memta %>%
+  group_by(MEs, condition_all) %>%
+  summarise(mean_eigengene = mean(value)) %>%
+  #group_by(MEs) %>%
+  #filter(mean_eigengene[condition_all == "HC"] < 0) %>%# View()
+  pivot_wider(id_cols = MEs,
+              names_from = condition_all,
+              values_from = mean_eigengene) %>%
+  column_to_rownames("MEs") %>%
+  Heatmap()
+```
+
+# Fit linear models
+
+```{r}
+model_eigengene <- function (index, df) {
+  
+  df <- df %>%
+    filter (MEs == index)
+  
+  modfull <- lm(value ~ condition + species + series, data = df)
+  modnull <- lm(value ~ species + series, data = df)
+  
+  lhr <- anova(modnull, modfull)
+  
+  return(list(index = index, modfull = modfull, lhr = lhr))
+  
+}
+
+
+res_list <- lapply(sort(unique(memta$MEs)), function (ME) {
+  model_eigengene(ME, memta)
+})
+
+ME_significances <- lapply(res_list, function(res) {
+  tibble(
+    MEs = res$index,
+    beta = res$modfull$coefficients['conditionINFL'],
+    p = res$lhr$`Pr(>F)`[[2]]
+  )
+}) %>% Reduce(function(df1, df2) rbind(df1, df2), .) %>%
+  mutate(padj = p.adjust(p, method = "BH"))
+```
+
+
+
+```{r}
+plt <- memta %>%
+  group_by(MEs, condition_all) %>%
+  summarise(mean_eigengene = mean(value)) %>%
+  #group_by(MEs) %>%
+  #filter(mean_eigengene[condition_all == "HC"] < 0) %>%# View()
+  pivot_wider(id_cols = MEs,
+              names_from = condition_all,
+              values_from = mean_eigengene) %>%
+  column_to_rownames("MEs")
+
+Heatmap(plt[ME_significances %>% filter(padj < 0.01) %>% pull(MEs), ],
+        clustering_method_columns = "ward.D2",
+        clustering_method_rows = "ward.D2")
+```
+
+# Get gene-level information
+
+```{r}
+gene_df <- tibble(
+  gene = names(net$colors),
+  MEs = paste0("ME", net$colors)
+) %>%
+  left_join(ME_significances) %>%
+  group_by(MEs) %>%
+  mutate(module_size = length(MEs)) %>%
+  ungroup() %>%
+  filter(padj < 0.01,
+         module_size < 500,
+         MEs %in% sig_modules) %>%
+  arrange(MEs, gene)
+```
+
+```{r}
+plt_meta <- cross_se_inflammatory %>%
+  colData() %>%
+  as.data.frame() %>%
+  mutate(condition = ifelse(condition == "HC", "HC", "INFL")) %>%
+  arrange(condition, species)
+
+plt <- lcpm[gene_df$gene, rownames(plt_meta)] %>%
+  t() %>%
+  scale() %>%
+  t()
+
+
+stopifnot(all(colnames(plt) == rownames(plt_meta)))
+
+saveRDS(plt_meta, "data/processed/data_1_fig_s6a.rds")
+saveRDS(plt, "data/processed/data_2_fig_s6a.rds")
+saveRDS(gene_df, "data/processed/data_3_fig_s6a.rds")
+```
+
+
+```{r}
+plt %>%
+  as.data.frame() %>%
+  rownames_to_column("gene") %>%
+  pivot_longer(
+    cols = -gene,
+    names_to = "sample",
+    values_to = "lcpm"
+    ) %>%
+  left_join(gene_df %>%
+              dplyr::select(gene, MEs),
+            by = "gene") %>%
+  left_join(plt_meta %>%
+              transmute(sample = SRX_accession,
+                        condition,
+                        species),
+            by = "sample") %>%
+  ggplot(aes(x = 1, color = condition, y = lcpm)) +
+    geom_boxplot() +
+    #geom_jitter() +
+    facet_wrap(~ MEs)
+```
+
+
+# Model more things
+
+```{r}
+model_eigengene_single <- function (index, df) {
+  
+  df <- df %>%
+    filter (MEs == index) %>%
+    mutate (condition_all = as.factor(condition_all),
+            condition_all = relevel(condition_all, ref = "HC"))
+  
+  mod <- lm(value ~ condition_all + species, data = df)
+  
+  mod_summary <- summary(mod)
+  
+  return(list(index = index, mod_summary = mod_summary, mod = mod))
+  
+}
+
+
+res_list_single <- lapply(sort(unique(memta$MEs)), function (ME) {
+  model_eigengene_single(ME, memta)
+})
+
+
+model_res_df <- lapply(res_list_single, function(res) {
+  res$mod_summary$coefficients %>%
+    as.data.frame() %>%
+    rownames_to_column("what") %>%
+    mutate(index = res$index)
+}) %>% Reduce(function(df1, df2) rbind(df1, df2), .)# %>%
+  # mutate(padj = p.adjust(p, method = "BH"))
+```
+
+
+```{r}
+plt_mod_betas <- model_res_df %>%
+  mutate(beta = ifelse(`Pr(>|t|)` < 0.05, Estimate, 0)) %>%
+  pivot_wider(id_cols = index,
+              names_from = what,
+              values_from = beta) %>%
+  column_to_rownames("index")
+
+saveRDS(plt_mod_betas, "data/processed/data_1_fig_s6b.rds")
+saveRDS(module_stats, "data/processed/data_2_fig_s6b.rds")
+```

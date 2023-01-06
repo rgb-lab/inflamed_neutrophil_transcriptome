@@ -1,0 +1,14 @@
+study_id	n	inflammatory_analysis	conds
+Adrover JM 2020	6	FALSE	PB_HC
+Catapano M 2019	11	FALSE	PB_HC
+de Graaf CA 2018	3	FALSE	PB_HC
+Franco LM 2019	2	FALSE	PB_HC
+Grabowski P 2019	22	FALSE	PB_HC
+McCreary M 2019	10	TRUE	PB_HC, PB_LPS
+Miralda I 2020	16	TRUE	PB_HC, PB_F.alocis
+Mistry P 2019	28	TRUE	PB_HC, PB_Lupus_NDN
+Ter Haar NM 2018	6	TRUE	PB_HC, PB_JIA
+Thomas HB 2015	12	TRUE	PB_HC, PB_GM.CSF, PB_TNF
+Vecchio F 2018	8	FALSE	PB_HC
+Wright HL 2013	6	TRUE	PB_HC, PB_TNF, PB_GM.CSF
+Wright HL 2020	6	TRUE	PB_HC, SF_RA

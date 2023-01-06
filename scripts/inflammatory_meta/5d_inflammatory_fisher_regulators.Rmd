@@ -1,0 +1,372 @@
+---
+title: "Regulator enrichment for inflammatory fisher signature"
+author: "NSH, FAR"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r, message=FALSE, include=FALSE}
+if (!require(tidyverse)) install.packages("tidyverse")
+if (!require(magrittr)) install.packages("magrittr")
+if (!require(dorothea)) BiocManager::install("dorothea")
+if (!require(decoupleR)) BiocManager::install("decoupleR")
+if (!require(OmnipathR)) BiocManager::install("OmnipathR")
+
+
+source("scripts/utils/config.R")
+source("scripts/utils/utils.R")
+source("scripts/utils/figure_builder.R")
+```
+
+```{r, include=FALSE}
+res_list <- readRDS("data/processed/de_seq_res_list.rds")
+lfc_df <- readRDS("data/processed/fisher_lfc_df.rds")
+```
+
+
+# Identify regulators that are associated with gene upregulation
+
+```{r}
+upreg_genes_list <- lapply (res_list, function (res) {
+  
+  upreg_genes <- res %>%
+    as.data.frame() %>%
+    rownames_to_column("symbol") %>%
+    filter(log2FoldChange > 0.5, padj < 0.05) %>% 
+    slice_min(order_by = padj, n = 250, with_ties = F) %>%
+    pull(symbol)
+  
+})
+
+chea_res_up <- lapply (names(upreg_genes_list), function (cur_name) {
+  
+  message("Chea...")
+  get_chea(upreg_genes_list[[cur_name]], cur_name)
+  
+})
+
+chea_res_up_df <- lapply (chea_res_up, function (res) {
+  
+  return (res[[1]])
+  
+})
+
+chea_res_up_df_all <- Reduce(rbind, chea_res_up_df)
+
+saveRDS(chea_res_up_df_all, "data/processed/data_fig_5a_1.rds")
+```
+
+Explore results on an individual level.
+
+```{r}
+nqueries <- length(unique(chea_res_up_df_all$`Query Name`))
+chea_matrix <- chea_res_up_df_all %>%
+  transmute(qname = `Query Name`,
+            TF,
+            logscore = -log10(as.numeric(Score))) %>%
+  group_by(TF) %>%
+  mutate(mean_tf_activity = mean (logscore)) %>%
+  ungroup() %>%
+  slice_max(order_by = mean_tf_activity, n = 40*nqueries, with_ties = FALSE) %>%
+  dplyr::select(-c(mean_tf_activity)) %>%
+  pivot_wider(names_from = "qname",
+              values_from = "logscore") %>%
+  column_to_rownames("TF")
+
+chea_matrix <- chea_matrix %>%
+  t() %>%
+  scale() %>%
+  t()
+  
+Heatmap(chea_matrix,
+        cluster_rows = FALSE,
+        cluster_columns = FALSE)
+```
+
+Look at correlation of individual TF activity.
+
+```{r, fig.height=5, fig.width=5}
+explore_up <- chea_res_up_df_all %>%
+  transmute(qname = `Query Name`,
+            TF,
+            logscore = -log10(as.numeric(Score))) %>%
+  pivot_wider(names_from = "qname",
+              values_from = "logscore") %>%
+  column_to_rownames("TF")
+
+expl_up_cor <- cor(explore_up, explore_up)
+Heatmap(expl_up_cor)
+```
+
+Scatter plot species comparison.
+
+```{r, fig.width=5, fig.height=5}
+fig_4b <- build_fig_4b()
+
+fig_4b 
+```
+
+# Identify regulators that are associated with gene downregulation
+
+```{r}
+dnreg_genes_list <- lapply (res_list, function (res) {
+  
+  dnreg_genes <- res %>%
+    as.data.frame() %>%
+    rownames_to_column("symbol") %>%
+    filter(log2FoldChange < -0.5, padj < 0.05) %>% 
+    slice_min(order_by = padj, n = 250, with_ties = F) %>%
+    pull(symbol)
+  
+})
+
+chea_res_dn <- lapply (names(dnreg_genes_list), function (cur_name) {
+  
+  message("Chea...")
+  get_chea(dnreg_genes_list[[cur_name]], cur_name)
+  
+})
+
+chea_res_dn_df <- lapply (chea_res_dn, function (res) {
+  
+  return (res[[1]])
+  
+})
+
+chea_res_dn_df_all <- Reduce(rbind, chea_res_dn_df)
+saveRDS(chea_res_dn_df_all, "data/processed/data_fig_5a_2.rds")
+```
+
+Explore results on an individual level.
+
+```{r, fig.height=5, fig.width=5}
+explore_dn <- chea_res_up_df_all %>%
+  transmute(qname = `Query Name`,
+            TF,
+            logscore = -log10(as.numeric(Score))) %>%
+  pivot_wider(names_from = "qname",
+              values_from = "logscore") %>%
+  column_to_rownames("TF")
+
+expl_cor_dn <- cor(explore_dn, explore_dn)
+Heatmap(expl_cor_dn)
+```
+
+Scatter plot species comparison.
+
+```{r, fig.width=4, fig.height=4}
+fig_4a <- build_fig_4a()
+
+fig_4a
+```
+
+
+# Regulatory activity profiles
+
+Plot the chea scores for each individual comparisons most up- and down-
+regulated genes.
+To this end we first perform two chea queries per comparison (up and down
+respectively) which we then combine for plotting.
+
+## Get ChEA data
+
+```{r}
+chea_res_updn_df_all <- rbind(
+  chea_res_up_df_all %>%
+    mutate(`Query Name` = paste(`Query Name`, "_up")),
+  chea_res_dn_df_all %>%
+    mutate(`Query Name` = paste(`Query Name`, "_dn"))
+)
+```
+
+## add some statistical reasoning for TF display
+
+```{r, fig.height=10, fig.width=10}
+TF_stats <- chea_res_updn_df_all %>%
+  transmute(qname = `Query Name`,
+            TF,
+            score = as.numeric(Score),
+            group = str_remove(qname, ".*_"),
+            comp = str_remove_all(qname, "_up|_dn")) %>%
+  dplyr::select(-qname) %>%
+  pivot_wider(names_from = group,
+              values_from = score,
+              names_prefix = "score_") %>%
+  mutate(diff = score_up - score_dn)
+
+ggplot(TF_stats, aes(x = diff)) +
+  geom_histogram()
+
+example_tfs <- TF_stats %>%
+  pull(TF) %>%
+  unique() %>%
+  `[`(1:100)
+
+ggplot(TF_stats %>%
+         filter(TF %in% example_tfs),
+       aes(x = diff)) +
+  geom_density() +
+  facet_wrap(~TF)
+```
+
+```{r}
+TF_stats %<>%
+  group_by(TF) %>%
+  mutate(p = t.test(score_up,
+                    score_dn,
+                    alternative = "two.sided",
+                    paired = T)$p.value,
+         t = t.test(score_up,
+                    score_dn,
+                    alternative = "two.sided",
+                    paired = T)$statistic,
+         meandiff = t.test(score_up,
+                           score_dn,
+                           alternative = "two.sided",
+                           paired = T)$estimate) %>%
+  ungroup()
+
+TF_stats_summary <- TF_stats %>%
+  group_by(TF) %>%
+  summarise(TF = unique(TF),
+            p = unique(p),
+            t = unique(t),
+            meandiff = unique(meandiff)
+            ) %>%
+  mutate(padj = p.adjust(p, method = "BH")) %>%
+  arrange(padj)
+
+TF_stat_row_annotation <- TF_stats_summary %>%
+  filter(padj < 0.05)  %>%
+  transmute(TF,
+            tf_group = case_when(
+              t < 0 ~ "a_up",
+              t > 0 ~ "c_dn"
+              ),
+            group_score = t,
+            padj
+            ) %>%
+  arrange(group_score) %>%
+  column_to_rownames("TF")
+```
+
+
+
+## Prepare data for plotting
+
+```{r}
+plt_data <- chea_res_updn_df_all %>%
+  transmute(qname = `Query Name`,
+            TF,
+            logscore = -log10(as.numeric(Score))) %>%
+  pivot_wider(names_from = "qname",
+              values_from = "logscore") %>%
+  column_to_rownames("TF")
+
+col_annotation <- plt_data %>%
+  rownames_to_column("TF") %>%
+  pivot_longer(cols = -"TF",
+               names_to = "qname",
+               values_to = "logscore") %>%
+  mutate(set = str_remove(qname, "^.*_")) %>%
+  dplyr::select(qname, set) %>%
+  distinct() %>%
+  arrange(set) %>%
+  column_to_rownames("qname")
+
+row_annotation <- TF_stat_row_annotation
+
+
+# filter and arrange
+plt_data <- plt_data[rownames(plt_data) %in% rownames(row_annotation), ]
+plt_data <- plt_data[match(rownames(row_annotation), rownames(plt_data)),
+                         match(rownames(col_annotation), colnames(plt_data))]
+
+saveRDS(plt_data, "data/processed/data_1_fig_5c.rds")
+saveRDS(col_annotation, "data/processed/data_2_fig_5c.rds")
+saveRDS(row_annotation, "data/processed/data_3_fig_5c.rds")
+```
+
+
+## Plot activity heatmap
+
+```{r fig.height=3, fig.width=5}
+fig_4d <- build_fig_4d()
+
+fig_4d
+```
+
+Dorothea analysis: 
+(1) Plot logFC of TF expression, use individual databases per species (dorothea) to avoid omitting anything.
+
+```{r}
+lfc_means <- lfc_df %>%
+  mutate(mean_Mm = rowMeans(.[,str_sub(colnames(lfc_df), start = -2) == "Mm" ]),
+         mean_Hs = rowMeans(.[,str_sub(colnames(lfc_df), start = -2) == "Hs" ])) %>%
+  dplyr::select(symbol, mean_Hs, mean_Mm)
+
+ortho_human_to_mouse <- readRDS("data/processed/ortho_human_to_mouse.rds")
+ortho_mouse_to_human <- readRDS("data/processed/ortho_mouse_to_human.rds")
+
+lfc_means <- merge(lfc_means, ortho_human_to_mouse[,c("external_gene_name", "mmusculus_homolog_associated_gene_name")],
+                   by.x = "symbol", by.y = "external_gene_name", all.x = T)
+
+lfc_means_tf <- lfc_means %>%
+  filter(symbol %in% dorothea_hs$tf | mmusculus_homolog_associated_gene_name %in% dorothea_mm$tf)
+
+saveRDS(lfc_means_tf, file = "data/processed/data_fig_4e.rds")
+```
+
+
+(2) Perform TFEA using decoupleR (based on dorothea databases) per species, then merge and prepare for plots.
+
+```{r}
+lfc_df %>%
+  mutate(mean_Mm = rowMeans(.[,str_sub(colnames(lfc_df), start = -2) == "Mm" ]),
+         mean_Hs = rowMeans(.[,str_sub(colnames(lfc_df), start = -2) == "Hs" ])) %>%
+  dplyr::select(symbol, mean_Hs, mean_Mm)
+
+lfc_df_Hs <- lfc_df %>%
+  column_to_rownames("symbol")
+lfc_df_Hs <- as.matrix(lfc_df_Hs[,str_sub(colnames(lfc_df_Hs), start = -2) == "Hs" ])
+
+lfc_df_Mm <- lfc_df %>%
+  left_join(ortho_human_to_mouse[,c("external_gene_name", "mmusculus_homolog_associated_gene_name")],
+            by = c("symbol" = "external_gene_name")) %>%
+  dplyr::select(-symbol) %>%
+  column_to_rownames("mmusculus_homolog_associated_gene_name")
+lfc_df_Mm <- as.matrix(lfc_df_Mm[,str_sub(colnames(lfc_df_Mm), start = -2) == "Mm" ])
+
+
+tf_Hs <- get_dorothea(organism='human', levels=c('A', 'B', 'C'))
+tf_Mm <- get_dorothea(organism='mouse', levels=c('A', 'B', 'C'))
+
+
+act_Hs <- run_wmean(mat=lfc_df_Hs, net=tf_Hs, .source='source', .target='target',
+                    .mor='mor', times = 100, minsize = 5)
+
+act_Mm <- run_wmean(mat=lfc_df_Mm, net=tf_Mm, .source='source', .target='target',
+          .mor='mor', times = 100, minsize = 5)
+
+act_merged_Hs <- act_Hs %>%
+  left_join(ortho_human_to_mouse[,c("external_gene_name", "mmusculus_homolog_associated_gene_name")], by = c("source" = "external_gene_name")) %>%
+  mutate(symbol_hs = source) %>%
+  dplyr::rename(symbol_mm = mmusculus_homolog_associated_gene_name) %>%
+  dplyr::select(symbol_hs, symbol_mm, condition, score, p_value) %>%
+  mutate(species = "Hs")
+
+act_merged_Mm <- act_Mm %>%
+  left_join(ortho_mouse_to_human[,c("external_gene_name", "hsapiens_homolog_associated_gene_name")], by = c("source" = "external_gene_name")) %>%
+  mutate(symbol_mm = source) %>%
+  dplyr::rename(symbol_hs = hsapiens_homolog_associated_gene_name) %>%
+  dplyr::select(symbol_hs, symbol_mm, condition, score, p_value) %>%
+  mutate(species = "Mm")
+
+act_merged <- rbind(act_merged_Hs, act_merged_Mm)
+
+saveRDS(act_merged, file = "data/processed/data_fig_4f.rds")
+```
+

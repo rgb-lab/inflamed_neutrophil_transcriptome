@@ -1,0 +1,106 @@
+---
+title: "Untitled"
+author: "FR"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r message=FALSE, include=FALSE}
+if (!require(tidyverse)) install.packages("tidyverse")
+if (!require(magrittr)) install.packages("magrittr")
+if (!require(ggplot2)) install.packages("ggplot2")
+if (!require(RColorBrewer)) install.packages("RColorBrewer")
+if (!require(BiocManager)) install.packages("BiocManager")
+if (!require(DESeq2)) BiocManager::install("DESeq2")
+if (!require(vsn)) BiocManager::install("vsn")
+if (!require(ComplexHeatmap)) BiocManager::install("ComplexHeatmap")
+if (!require(circlize)) BiocManager::install("circlize")
+if (!require(RVAideMemoire)) BiocManager::install("RVAideMemoire")
+if (!require(ggvenn)) BiocManager::install("ggvenn")
+
+
+# import color palettes
+source("scripts/utils/utils.R")
+source("scripts/utils/figure_builder.R")
+```
+
+Read increasing and decreasing accessibility data and create a list.
+
+```{r}
+BL_BM_i <- read.table("data/raw_data/zymosan/atac/GSE161765_DA_peaks_BL_VS_BM_increase.bed",header = F, sep="\t",stringsAsFactors=FALSE, quote="")$V7
+BL_BM_d <- read.table("data/raw_data/zymosan/atac/GSE161765_DA_peaks_BL_VS_BM_decrease.bed",header = F, sep="\t",stringsAsFactors=FALSE, quote="")$V7
+MEM_BM_i <- read.table("data/raw_data/zymosan/atac/GSE161765_DA_peaks_MEM_VS_BM_increase.bed",header = F, sep="\t",stringsAsFactors=FALSE, quote="")$V7
+MEM_BM_d <- read.table("data/raw_data/zymosan/atac/GSE161765_DA_peaks_MEM_VS_BM_decrease.bed",header = F, sep="\t",stringsAsFactors=FALSE, quote="")$V7
+AP_BM_i <- read.table("data/raw_data/zymosan/atac/GSE161765_DA_peaks_AP_VS_BM_increase.bed",header = F, sep="\t",stringsAsFactors=FALSE, quote="")$V7
+AP_BM_d <- read.table("data/raw_data/zymosan/atac/GSE161765_DA_peaks_AP_VS_BM_decrease.bed",header = F, sep="\t",stringsAsFactors=FALSE, quote="")$V7
+MEM_BL_i <- read.table("data/raw_data/zymosan/atac/GSE161765_DA_peaks_MEM_VS_BL_increase.bed",header = F, sep="\t",stringsAsFactors=FALSE, quote="")$V7
+MEM_BL_d <- read.table("data/raw_data/zymosan/atac/GSE161765_DA_peaks_MEM_VS_BL_decrease.bed",header = F, sep="\t",stringsAsFactors=FALSE, quote="")$V7
+AP_BL_i <- read.table("data/raw_data/zymosan/atac/GSE161765_DA_peaks_AP_VS_BL_increase.bed",header = F, sep="\t",stringsAsFactors=FALSE, quote="")$V7
+AP_BL_d <- read.table("data/raw_data/zymosan/atac/GSE161765_DA_peaks_AP_VS_BL_decrease.bed",header = F, sep="\t",stringsAsFactors=FALSE, quote="")$V7
+
+up_fisher_mouse <- readRDS("data/processed/up_fisher_mouse.rds")
+
+list_genes <- tibble::lst(up_fisher_mouse,
+                          BL_BM_i,
+                          BL_BM_d,
+                          MEM_BM_i,
+                          MEM_BM_d,
+                          AP_BM_i,
+                          AP_BM_d,
+                          MEM_BL_i,
+                          MEM_BL_d,
+                          AP_BL_i,
+                          AP_BL_d)
+```
+
+List comparisons and export for the figure.
+
+```{r}
+list_comparisons <- list(
+  "1 Blood vs. Bone marrow" = list_genes[c("up_fisher_mouse", "BL_BM_i", "BL_BM_d")],
+  "2 Membrane vs. Bone marrow" = list_genes[c("up_fisher_mouse", "MEM_BM_i", "MEM_BM_d")],
+  "3 Air pouch vs. Bone marrow" = list_genes[c("up_fisher_mouse", "AP_BM_i", "AP_BM_d")],
+  "4 Membrane vs. Blood" = list_genes[c("up_fisher_mouse", "MEM_BL_i", "MEM_BL_d")],
+  "5 Air pouch vs. Blood" = list_genes[c("up_fisher_mouse", "AP_BL_i", "AP_BL_d")]
+)
+
+saveRDS(list_comparisons, file = "data/processed/data_fig_5a.rds")
+
+build_fig_5a()
+```
+
+Perform Fisher's exact test and plot the Heatmap.
+
+```{r}
+sum_BL_BM <- sum(list_genes[["up_fisher_mouse"]] %in% list_genes[["BL_BM_i"]])
+sum_BL_BM_non <- length(list_genes[["up_fisher_mouse"]]) - sum_BL_BM
+sum_MEM_BM <- sum(list_genes[["up_fisher_mouse"]] %in% list_genes[["MEM_BM_i"]])
+sum_MEM_BM_non <-  length(list_genes[["up_fisher_mouse"]]) - sum_MEM_BM
+sum_AP_BM <- sum(list_genes[["up_fisher_mouse"]] %in% list_genes[["AP_BM_i"]])
+sum_AP_BM_non <- length(list_genes[["up_fisher_mouse"]]) - sum_AP_BM
+sum_MEM_BL <- sum(list_genes[["up_fisher_mouse"]] %in% list_genes[["MEM_BL_i"]])
+sum_MEM_BL_non <-  length(list_genes[["up_fisher_mouse"]]) - sum_MEM_BL
+sum_AP_BL <- sum(list_genes[["up_fisher_mouse"]] %in% list_genes[["AP_BL_i"]])
+sum_AP_BL_non <- length(list_genes[["up_fisher_mouse"]]) - sum_AP_BL
+
+tab <- rbind(
+  c(sum_BL_BM, sum_BL_BM_non),
+  c(sum_MEM_BM, sum_MEM_BM_non),
+  c(sum_AP_BM, sum_AP_BM_non),
+  c(sum_MEM_BL, sum_MEM_BL_non),
+  c(sum_AP_BL, sum_AP_BL_non)
+)
+colnames(tab) <- c("conserved_sum", "conserved_nohit")
+rownames(tab) <- c("BL_BM", "MEM_BM", "AP_BM","MEM_BL", "AP_BL")
+fisher_airpouch <- fisher.multcomp(tab)
+mat <- fisher_airpouch$p.value
+
+saveRDS(mat, file = "data/processed/data_fig_5b.rds")
+
+build_fig_5b()
+```
+
+

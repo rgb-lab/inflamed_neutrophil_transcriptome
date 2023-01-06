@@ -1,0 +1,249 @@
+---
+title: "Orthology mapping"
+author: "NSH"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r, message=FALSE, include=FALSE}
+if (!require(tidyverse)) install.packages("tidyverse")
+if (!require(magrittr)) install.packages("magrittr")
+if (!require(BiocManager)) install.packages("BiocManager")
+if (!require(biomaRt)) BiocManager::install("biomaRt")
+
+source("scripts/utils/utils.R")
+#source("scripts/utils/config.R")
+```
+
+```{r, message=FALSE, include=FALSE}
+# load data
+arch_hs_se <- readRDS("data/processed/arch_hs_se.rds")
+arch_mm_se <- readRDS("data/processed/arch_mm_se.rds")
+
+length(unique(colData(arch_hs_se)$GEO_accession))
+length(unique(colData(arch_mm_se)$GEO_accession))
+
+ensembl_human <- useEnsembl(biomart="ensembl", dataset="hsapiens_gene_ensembl", version = 107)
+ensembl_mouse <- useEnsembl(biomart="ensembl", dataset="mmusculus_gene_ensembl", version = 107)
+```
+
+# Orthology mapping
+
+As we have seen above, we now have two data objects, one for the Homo sapiens samples and one for the Mus musculus ones. To perform the subsequent steps of our analysis, we want to get both objects into the same feature space. We do this by performing orthology mapping between the two species and keeping the Human gene symbols as features. The information about the mapping itself is preserved in the `rowData` attribute of the `SummarizedExperiment`.
+
+The code below performs the mapping and creates a cross-species `SummarizedExperiment`, `cross_se`, based on the two existing objects.
+
+We are interested in orthologs that can be one2one-mapped between human and mouse symbols with high confidence.
+
+```{r}
+####################
+# RETRIEVE ENSEMBL #
+####################
+# ensembl dbs have been retrieved above
+
+# define the information to query from biomart
+attributes_human_query <- c(
+  "ensembl_gene_id",
+  "external_gene_name",
+  "mmusculus_homolog_ensembl_gene",
+  "mmusculus_homolog_associated_gene_name",
+  "mmusculus_homolog_orthology_type",
+  "mmusculus_homolog_subtype",
+  "mmusculus_homolog_perc_id",
+  "mmusculus_homolog_goc_score",
+  "mmusculus_homolog_wga_coverage",
+  "mmusculus_homolog_orthology_confidence"
+)
+attributes_mouse_query <- c(
+  "ensembl_gene_id",
+  "external_gene_name",
+  "hsapiens_homolog_ensembl_gene",
+  "hsapiens_homolog_associated_gene_name",
+  "hsapiens_homolog_orthology_type",
+  "hsapiens_homolog_subtype",
+  "hsapiens_homolog_perc_id",
+  "hsapiens_homolog_goc_score",
+  "hsapiens_homolog_wga_coverage",
+  "hsapiens_homolog_orthology_confidence"
+)
+
+# retrieve biomart information
+ortho_human_to_mouse <- getBM(attributes = attributes_human_query,
+                              filters = c("with_mmusculus_homolog", "biotype"),
+                              values = list(TRUE, "protein_coding"),
+                              mart = ensembl_human) %>%
+  filter(mmusculus_homolog_orthology_type == "ortholog_one2one",
+         mmusculus_homolog_orthology_confidence == 1,
+         external_gene_name != "",
+         mmusculus_homolog_associated_gene_name != "")
+
+ortho_mouse_to_human <- getBM(attributes = attributes_mouse_query,
+                              filters = c("with_hsapiens_homolog", "biotype"),
+                              values = list(TRUE, "protein_coding"),
+                              mart = ensembl_mouse) %>%
+  filter(hsapiens_homolog_orthology_type == "ortholog_one2one",
+         hsapiens_homolog_orthology_confidence == 1,
+         external_gene_name != "",
+         hsapiens_homolog_associated_gene_name != "")
+
+# clean biomart results
+clean_ortho_hs_mm <- ortho_human_to_mouse %>%
+  transmute(ensembl_human = ensembl_gene_id,
+            ensembl_mouse = mmusculus_homolog_ensembl_gene,
+            gene_human = external_gene_name,
+            gene_mouse = mmusculus_homolog_associated_gene_name)
+clean_ortho_mm_hs <- ortho_mouse_to_human %>%
+  transmute(ensembl_human = hsapiens_homolog_ensembl_gene,
+            ensembl_mouse = ensembl_gene_id,
+            gene_human = hsapiens_homolog_associated_gene_name,
+            gene_mouse = external_gene_name)
+
+# combine biomart results
+full_orthologs <- full_join(clean_ortho_hs_mm,
+                            clean_ortho_mm_hs)
+
+# check the unambiguous mappability of all retrieved genes
+full_ortho_stats <- full_orthologs %>%
+  group_by(ensembl_human) %>%
+  mutate(ens_n_mm_per_hs = length(ensembl_mouse)) %>%
+  group_by(ensembl_mouse) %>%
+  mutate(ens_n_hs_per_mm = length(ensembl_human)) %>%
+  group_by(gene_human) %>%
+  mutate(gene_n_mm_per_hs = length(gene_mouse)) %>%
+  group_by(gene_mouse) %>%
+  mutate(gene_n_hs_per_mm = length(gene_human)) %>%
+  ungroup()
+
+if (any(full_ortho_stats$ens_n_hs_per_mm != 1) |
+    any(full_ortho_stats$ens_n_mm_per_hs != 1) |
+    any(full_ortho_stats$gene_n_hs_per_mm != 1) |
+    any(full_ortho_stats$gene_n_mm_per_hs != 1)) {
+  warning("Ambiguous mappings present")
+}
+
+saveRDS(ortho_human_to_mouse, "data/processed/ortho_human_to_mouse.rds")
+saveRDS(ortho_mouse_to_human, "data/processed/ortho_mouse_to_human.rds")
+saveRDS(full_orthologs, "data/processed/full_orthologs.rds")
+```
+
+```{r}
+##############
+# MAP ORTHOS #
+##############
+
+# grab expression matrices
+expr_hs <- arch_hs_se %>%
+  assay() %>%
+  as.data.frame()
+expr_mm <- arch_mm_se %>%
+  assay() %>%
+  as.data.frame()
+# grab TPM
+abundance_hs <- arch_hs_se %>%
+  assay(assay = "abundance") %>%
+  as.data.frame()
+abundance_mm <- arch_mm_se %>%
+  assay(assay = "abundance") %>%
+  as.data.frame()
+
+
+# join matrices based on biomart filtered orthologs
+expr_cross <- full_ortho_stats %>%
+  # some random renaming (and col selection)
+  transmute(symbol_hs = gene_human,
+            symbol_mm = gene_mouse) %>%
+  inner_join(expr_hs %>% rownames_to_column("symbol_hs"), by = "symbol_hs") %>%
+  inner_join(expr_mm %>% rownames_to_column("symbol_mm"), by = "symbol_mm")
+
+abundance_cross <- full_ortho_stats %>%
+  # some random renaming (and col selection)
+  transmute(symbol_hs = gene_human,
+            symbol_mm = gene_mouse) %>%
+  inner_join(abundance_hs %>% rownames_to_column("symbol_hs"), by = "symbol_hs") %>%
+  inner_join(abundance_mm %>% rownames_to_column("symbol_mm"), by = "symbol_mm")
+
+
+rowdata_cross <- expr_cross %>%
+  dplyr::select(c(symbol_hs, symbol_mm))
+
+# some checks
+if (any(duplicated(expr_cross$symbol_hs)) |
+    any(duplicated(expr_cross$symbol_mm))) {
+  warning ("Duplicate gene symbols. Result most likely corrupted.")
+}
+if (any(is.na(expr_cross))) {
+  warning ("NAs in merged df. Result most likely corrupted.")
+}
+```
+
+```{r}
+###################
+# COMBINE COLDATA #
+###################
+coldata_hs <- arch_hs_se %>%
+  colData() %>%
+  as.data.frame()
+coldata_mm <- arch_mm_se %>%
+  colData() %>%
+  as.data.frame()
+
+coldata_cross <- rbind(coldata_hs, coldata_mm)
+
+expr_cross <- expr_cross %>%
+  column_to_rownames("symbol_hs") %>%
+  # remove Mm genes
+  dplyr::select(-symbol_mm) %>%
+  # arrange columns to match coldata
+  # TODO: find out the difference between the statement with and w/o "get"
+  dplyr::select(rownames(coldata_cross))
+
+abundance_cross <- abundance_cross %>%
+  column_to_rownames("symbol_hs") %>%
+  # remove Mm genes
+  dplyr::select(-symbol_mm) %>%
+  # arrange columns to match coldata
+  # TODO: find out the difference between the statement with and w/o "get"
+  dplyr::select(rownames(coldata_cross))
+
+# check again
+if (any(rownames(coldata_cross) != colnames(expr_cross))) warning("colData mismatch. Mapping result most likely corrupted.")
+if (any(rownames(coldata_cross) != colnames(abundance_cross))) warning("colData mismatch. Mapping result most likely corrupted.")
+
+cross_se <- SummarizedExperiment(assays = list(counts = expr_cross, abundance = abundance_cross),
+                                 colData = coldata_cross,
+                                 rowData = rowdata_cross)
+```
+
+# Add mapping information to individual species' SummarizedExperiments
+
+```{r}
+rowdata_hs <- tibble(gene_human = rownames(arch_hs_se)) %>%
+  left_join(full_ortho_stats, by = "gene_human") %>%
+  mutate(mappable = !is.na(gene_mouse)) %>%
+  DataFrame()
+
+rowdata_mm <- tibble(gene_mouse = rownames(arch_mm_se)) %>%
+  left_join(full_ortho_stats, by = "gene_mouse") %>%
+  mutate(mappable = !is.na(gene_human)) %>%
+  DataFrame()
+
+arch_hs_se_geneinfo <- SummarizedExperiment(
+  assays = list(counts = assay(arch_hs_se)),
+  colData = colData(arch_hs_se),
+  rowData = rowdata_hs
+)
+arch_mm_se_geneinfo <- SummarizedExperiment(
+  assays = list(counts = assay(arch_mm_se)),
+  colData = colData(arch_mm_se),
+  rowData = rowdata_mm
+)
+```
+
+```{r}
+saveRDS(arch_hs_se_geneinfo, "data/processed/arch_hs_se_geneinfo.rds")
+saveRDS(arch_mm_se_geneinfo, "data/processed/arch_mm_se_geneinfo.rds")
+saveRDS(cross_se, "data/processed/cross_se.rds")
+```

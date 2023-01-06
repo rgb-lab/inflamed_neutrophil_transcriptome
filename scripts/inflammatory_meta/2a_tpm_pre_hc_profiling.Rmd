@@ -1,0 +1,140 @@
+---
+title: "Healthy control profiling; tpm preprocessing"
+author: "NSH"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r, message=FALSE, include=FALSE}
+if (!require(ggrepel)) install.packages("ggrepel")
+if (!require(ggpubr)) install.packages("ggpubr")
+
+if (!require(BiocManager)) install.packages("BiocManager")
+if (!require(sva)) BiocManager::install("sva")
+if (!require(biomaRt)) BiocManager::install("biomaRt")
+if (!require(edgeR)) BiocManager::install("edgeR")
+if (!require(msigdbr)) install.packages("msigdbr")
+if (!require(fgsea)) install.packages("fgsea")
+if (!require(qusage)) BiocManager::install("qusage")
+
+source("scripts/utils/figure_builder.R")
+source("scripts/utils/utils.R")
+```
+
+```{r include=FALSE}
+cross_se <- readRDS("data/processed/cross_se.rds")
+
+arch_hs_se_geneinfo <- readRDS("data/processed/arch_hs_se_geneinfo.rds")
+arch_mm_se_geneinfo <- readRDS("data/processed/arch_mm_se_geneinfo.rds")
+```
+
+Here, we preprocess tpm for plotting in the Figure 2 scatterplots.
+
+# Comparison of gene expression across species
+
+```{r, fig.height=10, fig.width=10}
+ensembl_human <- useEnsembl(biomart="ensembl", dataset="hsapiens_gene_ensembl", version = 107)
+ensembl_mouse <- useEnsembl(biomart="ensembl", dataset="mmusculus_gene_ensembl", version = 107)
+```
+
+
+```{r, fig.height=10, fig.width=10}
+# get gene length information: human
+gene_info <- getBM(attributes = c("ensembl_gene_id",
+                                  "external_gene_name",
+                                  "start_position",
+                                  "end_position"),
+                   mart = ensembl_human)
+gene_info_rel <- gene_info %>%
+  transmute(symbol = external_gene_name,
+            length = end_position - start_position) %>%
+  # summarise duplicate gene lengths to their mean
+  group_by(symbol) %>%
+  summarise(average_length = mean(length))
+
+# get gene length information: mouse
+gene_info_mouse <- getBM(attributes = c("ensembl_gene_id",
+                                        "external_gene_name",
+                                        "start_position",
+                                        "end_position"),
+                   mart = ensembl_mouse)
+gene_info_rel_mouse <- gene_info_mouse %>%
+  transmute(symbol = external_gene_name,
+            length = end_position - start_position) %>%
+  # summarise duplicate gene lengths to their mean
+  group_by(symbol) %>%
+  summarise(average_length = mean(length))
+```
+
+Define a helper function to obtain expression statistics.
+
+```{r, fig.height=10, fig.width=10}
+get_expr_stats <- function(SEobject, gene_info_rel, norm_method) {
+    # filter to only HC samples from peripheral blood and bm
+  sel_cond <- c("HC")
+  sel_tissue <- c("PB", "BM") #, "liver", "spleen", "lung")
+  
+  SEobject <- SEobject[, SEobject$condition %in% sel_cond &
+                                   SEobject$origin_tissue %in% sel_tissue]
+  if(norm_method == "tpm"){
+      cross_expr <- as.data.frame(assay(SEobject, assay = "abundance"))
+      cross_expr_norm <- log2(cross_expr+1)
+
+  }else{
+      cross_expr <- as.data.frame(assay(SEobject))
+  }
+  
+  cross_coldata <- as.data.frame(colData(SEobject))
+  
+  assays(SEobject) <- list(counts = assay(SEobject))
+  
+  dge <- calcNormFactors(SEobject, method = "TMM")
+
+  lengths_vec <- dge$counts %>%
+    as.data.frame() %>%
+    rownames_to_column("symbol") %>%
+    left_join(gene_info_rel, by = "symbol") %>%
+    replace(is.na(.), 0) %>%
+    pull(average_length)
+  if (norm_method == "cpm") {
+    cpm_tmm_expr <- edgeR::cpm(dge, log = TRUE, normalized.lib.sizes = TRUE)
+    cross_expr_norm <- cpm_tmm_expr
+  }
+  if (norm_method == "rpkm") {
+    rpkm_tmm_expr <- rpkm(dge, log = TRUE, normalized.lib.sizes = TRUE, gene.length = lengths_vec)
+    cross_expr_norm <- rpkm_tmm_expr
+  }
+  
+  expr_stats <- cross_expr_norm %>%
+    as.data.frame() %>%
+    rownames_to_column("symbol") %>%
+    pivot_longer(cols = -"symbol",
+                 names_to = "sample_id",
+                 values_to = "count") %>%
+    left_join(cross_coldata %>%
+                rownames_to_column("sample_id") %>%
+                dplyr::select(sample_id, species),
+              by = "sample_id") %>%
+    group_by(symbol) %>%
+    mutate(hs_avg = mean(count[species == "Hs"]),
+           mm_avg = mean(count[species == "Mm"]),
+           wilcox_p = wilcox.test(count[species == "Hs"],
+                                 count[species == "Mm"],
+                                 alternative = "two.sided")[["p.value"]]) %>%
+    dplyr::select(symbol, hs_avg, mm_avg, wilcox_p) %>%
+    distinct()
+  
+  return (expr_stats)
+}
+```
+
+Generate and save the data needed for plotting.
+
+```{r}
+uncor_tpm <- get_expr_stats(cross_se, gene_info_rel, "tpm")
+
+saveRDS(uncor_tpm, "data/processed/data_5_fig_3a.rds")
+```
